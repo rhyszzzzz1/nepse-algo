@@ -618,8 +618,8 @@ def init_data():
     threading.Thread(target=run, daemon=True).start()
     return jsonify({
         "status": "started",
-        "message": "Data fetch running in background. Takes 20-30 mins. Check /api/health for row counts."
-    })
+"message": "Data fetch running in background. Takes 3-5 mins. Check /api/health for row counts."
+  })
 
 
 # ── BACKGROUND JOB TRACKER ────────────────────────────────────────────────────
