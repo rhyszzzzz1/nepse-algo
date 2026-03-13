@@ -186,25 +186,41 @@ def fetch_price_history(symbol):
         conn.close()
 
 # ── FETCH PRICE HISTORY FOR ALL COMPANIES ────────────────────────────────────
-def fetch_all_price_histories():
-    """Fetch price history for every company in the database."""
+# ── FETCH PRICE HISTORY FOR ALL COMPANIES (PARALLEL) ─────────────────────────
+def fetch_all_price_histories(max_workers=10):
+    """Fetch price history for every company using parallel threads."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     conn = get_db()
     symbols = [row[0] for row in conn.execute("SELECT symbol FROM companies").fetchall()]
     conn.close()
 
-    print(f"Fetching price history for {len(symbols)} companies...")
-    success, failed = 0, 0
+    total = len(symbols)
+    print(f"Fetching price history for {total} companies using {max_workers} parallel workers...")
 
-    for i, symbol in enumerate(symbols):
-        print(f"[{i+1}/{len(symbols)}] ", end="")
-        result = fetch_price_history(symbol)
-        if result is not None:
-            success += 1
-        else:
-            failed += 1
+    success, failed = 0, 0
+    completed = 0
+
+    def fetch_one(symbol):
+        try:
+            result = fetch_price_history(symbol)
+            return symbol, result is not None
+        except:
+            return symbol, False
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_one, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol, ok = future.result()
+            completed += 1
+            if ok:
+                success += 1
+            else:
+                failed += 1
+            if completed % 20 == 0:
+                print(f"   Progress: {completed}/{total} | Success: {success} | Failed: {failed}")
 
     print(f"\n✅ Done. Success: {success} | Failed: {failed}")
-
 # ── FETCH FLOOR SHEET ─────────────────────────────────────────────────────────
 def fetch_floor_sheet_for(symbol):
     """Fetch today's floor sheet (broker trades) for a symbol."""
