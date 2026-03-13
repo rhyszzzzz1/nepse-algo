@@ -602,33 +602,66 @@ def top_movers():
 
 
 # ── INIT DATA ─────────────────────────────────────────────────────────────────
+_init_status = {"status": "idle", "step": None, "error": None}
+
 @app.route("/api/init-data", methods=["POST", "GET"])
 def init_data():
-    """Re-fetch all data after Railway restart."""
+    """Re-fetch all data. Runs in background. Poll /api/init-status for progress."""
+    global _init_status
+    if _init_status.get("status") == "running":
+        return jsonify({"status": "already_running", "step": _init_status.get("step")})
+
     def run():
+        global _init_status
+        _init_status = {"status": "running", "step": "starting", "error": None}
         try:
+            _init_status["step"] = "importing modules"
+            # Ensure src is on path
+            import sys, os
+            src_dir = os.path.join(ROOT, "src")
+            if src_dir not in sys.path:
+                sys.path.insert(0, src_dir)
+
             from data.fetcher import create_tables, fetch_company_list, fetch_all_price_histories
             from data.cleaner import create_clean_table, clean_all_symbols
             from signals.nepse_signals import create_signals_table, calculate_all_signals
+
+            _init_status["step"] = "create_tables"
             create_tables()
+            _init_status["step"] = "fetch_company_list"
             fetch_company_list()
-            fetch_all_price_histories(max_workers=3)
+            _init_status["step"] = "fetch_all_price_histories"
+            fetch_all_price_histories(max_workers=5)
+            _init_status["step"] = "create_clean_table"
             create_clean_table()
-            clean_all_symbols(max_workers=3)
+            _init_status["step"] = "clean_all_symbols"
+            clean_all_symbols(max_workers=5)
+            _init_status["step"] = "create_signals_table"
             create_signals_table()
-            calculate_all_signals(max_workers=3)
+            _init_status["step"] = "calculate_all_signals"
+            calculate_all_signals(max_workers=5)
+
+            _init_status = {"status": "done", "step": "complete", "error": None}
             print("✅ Init data complete")
         except Exception as e:
-            print(f"❌ Init data error: {e}")
             import traceback
-            traceback.print_exc()
+            err = traceback.format_exc()
+            _init_status = {"status": "error", "step": _init_status.get("step"), "error": str(e), "traceback": err}
+            print(f"❌ Init data error at step '{_init_status['step']}': {e}")
+            print(err)
 
     import threading
     threading.Thread(target=run, daemon=True).start()
     return jsonify({
         "status": "started",
-"message": "Data fetch running in background. Takes 3-5 mins. Check /api/health for row counts."
-  })
+        "message": "Data fetch started. Poll /api/init-status for live progress."
+    })
+
+
+@app.route("/api/init-status")
+def init_status():
+    """Check the status of a running init-data job."""
+    return jsonify(_init_status)
 
 
 # ── BACKGROUND JOB TRACKER ────────────────────────────────────────────────────
