@@ -432,6 +432,81 @@ def optimizer_symbol(symbol):
         conn.close()
 
 
+# ── TRADING RULES ─────────────────────────────────────────────────────────────
+@app.route("/api/rules/<symbol>")
+def get_rules_for_symbol(symbol):
+    """
+    Return all scored trading rules for a symbol, sorted by weighted_score DESC.
+    ?limit=N (default 20)  ?type=single|combination  (optional filter)
+    """
+    conn = get_db()
+    try:
+        symbol    = symbol.upper()
+        limit     = int(request.args.get("limit", 20))
+        rule_type = request.args.get("type", "").lower()
+
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if "trading_rules" not in tables:
+            return jsonify({"symbol": symbol, "count": 0, "rules": [],
+                            "message": "trading_rules table not yet created — run scorer.py first"})
+
+        query  = "SELECT * FROM trading_rules WHERE symbol = ?"
+        params = [symbol]
+        if rule_type in ("single", "combination"):
+            query += " AND rule_type = ?"
+            params.append(rule_type)
+        query += " ORDER BY weighted_score DESC LIMIT ?"
+        params.append(limit)
+
+        rows = rows_to_list(conn.execute(query, params).fetchall())
+        return jsonify({"symbol": symbol, "count": len(rows), "rules": rows})
+    finally:
+        conn.close()
+
+
+@app.route("/api/rules")
+def get_rules_summary():
+    """
+    Return a summary of how many trading rules exist per symbol.
+    ?limit=N (default 50)
+    """
+    conn = get_db()
+    try:
+        limit = int(request.args.get("limit", 50))
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if "trading_rules" not in tables:
+            return jsonify({"count": 0, "symbols": [],
+                            "message": "trading_rules table not yet created"})
+
+        total = conn.execute("SELECT COUNT(*) FROM trading_rules").fetchone()[0]
+        by_type = rows_to_list(conn.execute("""
+            SELECT rule_type, COUNT(*) AS n FROM trading_rules GROUP BY rule_type
+        """).fetchall())
+
+        symbols = rows_to_list(conn.execute("""
+            SELECT symbol, COUNT(*) AS rule_count,
+                   MAX(weighted_score) AS top_score,
+                   AVG(weighted_score) AS avg_score
+            FROM   trading_rules
+            GROUP  BY symbol
+            ORDER  BY rule_count DESC
+            LIMIT  ?
+        """, (limit,)).fetchall())
+
+        return jsonify({
+            "total_rules":  total,
+            "by_type":      by_type,
+            "symbols":      symbols,
+            "symbol_count": len(symbols),
+        })
+    finally:
+        conn.close()
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
@@ -452,5 +527,7 @@ if __name__ == "__main__":
     print("  GET /api/sectors")
     print("  GET /api/optimizer/leaderboard")
     print("  GET /api/optimizer/<SYMBOL>")
+    print("  GET /api/rules/<SYMBOL>")
+    print("  GET /api/rules")
     print()
     app.run(debug=True, port=5000, use_reloader=False)

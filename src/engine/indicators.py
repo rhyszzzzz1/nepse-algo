@@ -25,11 +25,12 @@ def get_db():
 # INDICATOR CONFIG CATALOGUE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_all_indicator_configs():
+def get_all_indicator_configs(silent: bool = False):
     """
     Return a list of every indicator config dict.
     Each dict has keys: name, type, indicator, params.
     Uses itertools.product to enumerate all parameter combos.
+    Pass silent=True to suppress the count print.
     """
     configs = []
 
@@ -201,7 +202,8 @@ def get_all_indicator_configs():
             "params":    {"fast": fast, "slow": slow},
         })
 
-    print(f"Total indicator configs: {len(configs)}")
+    if not silent:
+        print(f"Total indicator configs: {len(configs)}")
     return configs
 
 
