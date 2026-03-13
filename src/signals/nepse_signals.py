@@ -3,7 +3,12 @@
 # Calculates signals unique to Nepal's market structure:
 # pump/dump scoring, broker accumulation/distribution,
 # liquidity spikes, and volatility regime classification.
+import sqlite3
+import os
 
+# Force SQLite — ignore any PostgreSQL environment variables
+os.environ.pop("DATABASE_URL", None)
+os.environ.pop("POSTGRES_URL", None)
 import sqlite3
 from db import get_db
 import os

@@ -2,7 +2,12 @@
 # Step 2: NEPSE Data Fetcher
 # Fetches price, volume, floor sheet and market data from nepalstock.com
 # and stores everything in a local SQLite database.
+import sqlite3
+import os
 
+# Force SQLite — ignore any PostgreSQL environment variables
+os.environ.pop("DATABASE_URL", None)
+os.environ.pop("POSTGRES_URL", None)
 from nepse import Nepse
 import pandas as pd
 import sqlite3

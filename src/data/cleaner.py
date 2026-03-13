@@ -3,7 +3,12 @@
 # Cleans raw price_history rows, computes derived indicators, and tags each row
 # with a market condition (bull / bear / sideways).
 # Uses the 'ta' library (NOT pandas_ta).
+import sqlite3
+import os
 
+# Force SQLite — ignore any PostgreSQL environment variables
+os.environ.pop("DATABASE_URL", None)
+os.environ.pop("POSTGRES_URL", None)
 import sqlite3
 from db import get_db
 import os

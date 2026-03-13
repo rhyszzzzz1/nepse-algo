@@ -600,7 +600,7 @@ def top_movers():
 # ── INIT DATA ─────────────────────────────────────────────────────────────────
 @app.route("/api/init-data", methods=["POST", "GET"])
 def init_data():
-    """Re-fetch all data after Railway restart. Visit this URL once after deploy."""
+    """Re-fetch all data after Railway restart."""
     def run():
         try:
             from data.fetcher import create_tables, fetch_company_list, fetch_all_price_histories
@@ -608,11 +608,11 @@ def init_data():
             from signals.nepse_signals import create_signals_table, calculate_all_signals
             create_tables()
             fetch_company_list()
-            fetch_all_price_histories()
+            fetch_all_price_histories(max_workers=3)
             create_clean_table()
-            clean_all_symbols()
+            clean_all_symbols(max_workers=3)
             create_signals_table()
-            calculate_all_signals()
+            calculate_all_signals(max_workers=3)
             print("✅ Init data complete")
         except Exception as e:
             print(f"❌ Init data error: {e}")
