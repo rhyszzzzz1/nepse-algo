@@ -33,13 +33,7 @@ except ImportError:
     DEFAULT_POSITION_SIZE_PCT = 10.0
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
-DB_PATH = os.path.join(ROOT, "data", "nepse.db")
-
-def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+from db import get_db, DB_PATH
 
 def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
