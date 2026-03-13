@@ -797,4 +797,5 @@ if __name__ == "__main__":
     print("  GET  /api/rules/<SYMBOL>")
     print("  GET  /api/rules")
     print()
-    app.run(debug=FLASK_DEBUG, port=API_PORT, use_reloader=False)
+    port = int(os.environ.get("PORT", API_PORT))
+    app.run(host="0.0.0.0", debug=FLASK_DEBUG, port=port, use_reloader=False)
