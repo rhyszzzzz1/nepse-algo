@@ -1,1 +1,1 @@
-web: gunicorn --chdir src/api app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+web: python -m gunicorn src.api.app:app --bind 0.0.0.0:$PORT
