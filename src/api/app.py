@@ -41,7 +41,10 @@ else:
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=60.0)
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass  # WAL may fail on some filesystems, not critical
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -85,28 +88,28 @@ def index():
 # ── HEALTH ────────────────────────────────────────────────────────────────────
 @app.route("/api/health")
 def health():
-    conn = get_db()
     try:
-        price_rows = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
-        clean_rows = conn.execute("SELECT COUNT(*) FROM clean_price_history").fetchone()[0]
-        companies  = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
-    except:
-        price_rows = 0; clean_rows = 0; companies = 0
-    finally:
-        conn.close()
+        conn = get_db()
+        try:
+            price_rows = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+            clean_rows = conn.execute("SELECT COUNT(*) FROM clean_price_history").fetchone()[0]
+            companies  = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+        except Exception:
+            price_rows = 0; clean_rows = 0; companies = 0
+        finally:
+            conn.close()
 
-    env_vars = {k: v for k, v in os.environ.items() if "VOL" in k.upper() or "RAILWAY" in k.upper()}
-
-    return jsonify({
-        "status": "ok",
-        "time": datetime.now().isoformat(),
-        "env": env_vars,
-        "db": {
-            "companies": companies,
-            "price_rows": price_rows,
-            "clean_rows": clean_rows,
-        }
-    })
+        env_vars = {k: v for k, v in os.environ.items() if "VOL" in k.upper() or "RAILWAY" in k.upper()}
+        return jsonify({
+            "status": "ok",
+            "db_path": DB_PATH,
+            "time": datetime.now().isoformat(),
+            "env": env_vars,
+            "db": {"companies": companies, "price_rows": price_rows, "clean_rows": clean_rows},
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"status": "error", "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 # ── MARKET OVERVIEW ───────────────────────────────────────────────────────────
