@@ -29,7 +29,17 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from engine.backtester import run_backtest, DEFAULT_CONFIG
 from engine.indicators import generate_signals
 
-DB_PATH = os.path.join(ROOT, "data", "nepse.db")
+try:
+    from config import (DB_PATH, DEFAULT_BACKTEST_CONFIG,
+                        MIN_WINRATE, WALK_FORWARD_MIN_WR,
+                        MONTE_CARLO_RUNS, MONTE_CARLO_MIN_P5)
+except ImportError:
+    DB_PATH = os.path.join(ROOT, "data", "nepse.db")
+    DEFAULT_BACKTEST_CONFIG = {"stop_loss_pct": 5.0, "take_profit_pct": 10.0,
+                               "max_hold_days": 15, "initial_capital": 100_000,
+                               "position_size_pct": 10.0}
+    MIN_WINRATE = 0.48; WALK_FORWARD_MIN_WR = 0.45
+    MONTE_CARLO_RUNS = 1000; MONTE_CARLO_MIN_P5 = 0.40
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
@@ -73,7 +83,7 @@ def _equity_max_drawdown(trade_pnl_pcts: list[float],
 
 # ── GATE 1: MINIMUM WIN RATE ───────────────────────────────────────────────────
 def gate1_minimum_winrate(backtest_result: dict,
-                           threshold: float = 0.48) -> dict:
+                           threshold: float = MIN_WINRATE) -> dict:
     """
     Gate 1: total win rate on the full history must meet *threshold*.
 
@@ -104,7 +114,7 @@ def gate2_walk_forward(symbol: str,
                         indicator_config: dict,
                         backtest_config: dict | None = None,
                         split: float = 0.70,
-                        test_threshold: float = 0.45) -> dict:
+                        test_threshold: float = WALK_FORWARD_MIN_WR) -> dict:
     """
     Gate 2: Walk-forward validation.
 
@@ -237,8 +247,8 @@ def gate3_regime_test(symbol: str,
 
 # ── MONTE CARLO SIMULATION ────────────────────────────────────────────────────
 def monte_carlo(trades: list[dict],
-                n_simulations: int = 1000,
-                confirmed_threshold: float = 0.40) -> dict:
+                n_simulations: int = MONTE_CARLO_RUNS,
+                confirmed_threshold: float = MONTE_CARLO_MIN_P5) -> dict:
     """
     Monte Carlo simulation: randomly re-order trade sequence *n_simulations*
     times and measure win rate + drawdown distribution.
@@ -309,10 +319,10 @@ def monte_carlo(trades: list[dict],
 def run_all_survival_tests(symbol: str,
                             indicator_config: dict,
                             backtest_config: dict | None = None,
-                            gate1_threshold: float = 0.48,
-                            gate2_threshold: float = 0.45,
-                            mc_threshold:   float = 0.40,
-                            n_simulations:  int   = 1000) -> dict:
+                            gate1_threshold: float = MIN_WINRATE,
+                            gate2_threshold: float = WALK_FORWARD_MIN_WR,
+                            mc_threshold:   float = MONTE_CARLO_MIN_P5,
+                            n_simulations:  int   = MONTE_CARLO_RUNS) -> dict:
     """
     Run all 3 survival gates + Monte Carlo for one symbol×indicator combo.
 
@@ -439,11 +449,7 @@ if __name__ == "__main__":
     SYMBOL = "NABIL"
 
     BT_CONFIG = {
-        "stop_loss_pct":     5.0,
-        "take_profit_pct":  10.0,
-        "max_hold_days":    15,
-        "initial_capital":  100_000,
-        "position_size_pct": 10.0,
+        **DEFAULT_BACKTEST_CONFIG,
     }
 
     # Test 5 indicator configs

@@ -12,7 +12,19 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "nepse.db")
+try:
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+    from config import (DB_PATH, API_PORT, FLASK_DEBUG,
+                        DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
+                        DEFAULT_MAX_HOLD_DAYS, DEFAULT_INITIAL_CAPITAL,
+                        DEFAULT_POSITION_SIZE_PCT)
+except ImportError:
+    DB_PATH    = os.path.join(os.path.dirname(__file__), "..", "..", "data", "nepse.db")
+    API_PORT   = 5000; FLASK_DEBUG = True
+    DEFAULT_STOP_LOSS_PCT = 5.0; DEFAULT_TAKE_PROFIT_PCT = 10.0
+    DEFAULT_MAX_HOLD_DAYS = 15;  DEFAULT_INITIAL_CAPITAL = 100_000
+    DEFAULT_POSITION_SIZE_PCT = 10.0
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
@@ -24,6 +36,39 @@ def get_db():
 
 def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
+
+
+# ── ROOT INDEX ────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    """API index — lists all available endpoints."""
+    return jsonify({
+        "name":    "NEPSE Algorithmic Trading API",
+        "version": "1.0",
+        "status":  "running",
+        "endpoints": [
+            "GET  /api/health",
+            "GET  /api/market-summary",
+            "GET  /api/market/overview",
+            "GET  /api/top-movers",
+            "GET  /api/companies",
+            "GET  /api/sectors",
+            "GET  /api/signals?signal=BUY&limit=20",
+            "GET  /api/signals/<SYMBOL>",
+            "GET  /api/price/<SYMBOL>?days=90",
+            "GET  /api/stock/<SYMBOL>",
+            "GET  /api/stock/<SYMBOL>/ohlcv",
+            "GET  /api/screener",
+            "GET  /api/backtest",
+            "GET  /api/backtest/<SYMBOL>",
+            "POST /api/run-backtest",
+            "GET  /api/run-backtest/<SYMBOL>",
+            "GET  /api/optimizer/leaderboard",
+            "GET  /api/optimizer/<SYMBOL>",
+            "GET  /api/rules",
+            "GET  /api/rules/<SYMBOL>",
+        ]
+    })
 
 
 # ── HEALTH ────────────────────────────────────────────────────────────────────
@@ -600,9 +645,9 @@ def run_backtest_endpoint():
         if not symbol:
             return jsonify({"error": "symbol is required"}), 400
 
-        sl   = float(body.get("stop_loss_pct",   5.0))
-        tp   = float(body.get("take_profit_pct", 10.0))
-        hold = int(body.get("max_hold_days",     15))
+        sl   = float(body.get("stop_loss_pct",   DEFAULT_STOP_LOSS_PCT))
+        tp   = float(body.get("take_profit_pct", DEFAULT_TAKE_PROFIT_PCT))
+        hold = int(body.get("max_hold_days",     DEFAULT_MAX_HOLD_DAYS))
 
         job_id = _job_id(symbol)
         with _job_lock:
@@ -623,8 +668,8 @@ def run_backtest_endpoint():
                     "stop_loss_pct":     sl,
                     "take_profit_pct":   tp,
                     "max_hold_days":     hold,
-                    "initial_capital":   100_000,
-                    "position_size_pct": 10.0,
+                    "initial_capital":   DEFAULT_INITIAL_CAPITAL,
+                    "position_size_pct": DEFAULT_POSITION_SIZE_PCT,
                 }
                 rules = run_full_pipeline(symbol, cfg, verbose=False)
                 with _job_lock:
@@ -752,4 +797,4 @@ if __name__ == "__main__":
     print("  GET  /api/rules/<SYMBOL>")
     print("  GET  /api/rules")
     print()
-    app.run(debug=True, port=5000, use_reloader=False)
+    app.run(debug=FLASK_DEBUG, port=API_PORT, use_reloader=False)

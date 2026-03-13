@@ -32,22 +32,25 @@ from engine.backtester  import backtest_all_indicators, DEFAULT_CONFIG
 from engine.indicators  import get_all_indicator_configs
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-DB_PATH = "data/nepse.db"
+try:
+    from config import DB_PATH, DEFAULT_BACKTEST_CONFIG as BACKTEST_CONFIG
+except ImportError:
+    _ROOT3 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    DB_PATH = os.path.join(_ROOT3, "data", "nepse.db")
+    BACKTEST_CONFIG = {
+        "stop_loss_pct": 5.0, "take_profit_pct": 10.0,
+        "max_hold_days": 15,  "initial_capital": 100_000,
+        "position_size_pct": 10.0,
+    }
 
-BACKTEST_CONFIG = {
-    "stop_loss_pct":     5.0,
-    "take_profit_pct":  10.0,
-    "max_hold_days":    15,
-    "initial_capital":  100_000,
-    "position_size_pct": 10.0,
-}
 
 MIN_TRADES = 3   # discard configs with fewer trades (statistically meaningless)
 
 
+
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
 def get_db():
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     return sqlite3.connect(DB_PATH)
 
 

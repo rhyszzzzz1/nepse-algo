@@ -35,7 +35,21 @@ from engine.combinations import (build_combinations, generate_combination_signal
                                   load_top_survivors_from_db, _mock_survivors,
                                   _load_symbol, _load_nepse_signals)
 
-DB_PATH = os.path.join(ROOT, "data", "nepse.db")
+try:
+    from config import (DB_PATH, DEFAULT_BACKTEST_CONFIG,
+                        WEIGHT_WINRATE, WEIGHT_PROFIT_FACTOR,
+                        WEIGHT_CONSISTENCY, WEIGHT_DRAWDOWN,
+                        PROFIT_FACTOR_CAP,
+                        MIN_WINRATE, WALK_FORWARD_MIN_WR, MONTE_CARLO_MIN_P5)
+except ImportError:
+    DB_PATH = os.path.join(ROOT, "data", "nepse.db")
+    DEFAULT_BACKTEST_CONFIG = {"stop_loss_pct": 5.0, "take_profit_pct": 10.0,
+                               "max_hold_days": 15, "initial_capital": 100_000,
+                               "position_size_pct": 10.0}
+    WEIGHT_WINRATE = 0.35; WEIGHT_PROFIT_FACTOR = 0.30
+    WEIGHT_CONSISTENCY = 0.20; WEIGHT_DRAWDOWN = 0.15
+    PROFIT_FACTOR_CAP = 3.0
+    MIN_WINRATE = 0.48; WALK_FORWARD_MIN_WR = 0.45; MONTE_CARLO_MIN_P5 = 0.40
 
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
@@ -92,18 +106,18 @@ def calculate_score(metrics: dict) -> float:
     consistency        (0-100)   weight 0.20  — % quarters profitable
     low_drawdown_score (0-100)   weight 0.15  — (1 - max_drawdown%) * 100
     """
-    wr  = float(metrics.get("winrate",           0))    # already 0-100
+    wr  = float(metrics.get("winrate",           0))
     pf  = float(metrics.get("profit_factor",     0))
-    con = float(metrics.get("consistency",       0))    # already 0-100
-    dd  = float(metrics.get("max_drawdown",      0))    # 0-100 %
+    con = float(metrics.get("consistency",       0))
+    dd  = float(metrics.get("max_drawdown",      0))
 
-    pf_norm      = min(pf / 3.0, 1.0) * 100.0          # cap at 3× → 0-100
-    dd_score     = max(0.0, (1.0 - dd / 100.0)) * 100  # 0-100, higher=better
+    pf_norm      = min(pf / PROFIT_FACTOR_CAP, 1.0) * 100.0
+    dd_score     = max(0.0, (1.0 - dd / 100.0)) * 100
 
-    score = (wr  * 0.35
-           + pf_norm   * 0.30
-           + con        * 0.20
-           + dd_score   * 0.15)
+    score = (wr  * WEIGHT_WINRATE
+           + pf_norm   * WEIGHT_PROFIT_FACTOR
+           + con        * WEIGHT_CONSISTENCY
+           + dd_score   * WEIGHT_DRAWDOWN)
 
     return round(score, 4)
 
@@ -175,9 +189,9 @@ def save_rule(symbol:           str,
 # ── FULL PIPELINE FOR ONE SYMBOL ──────────────────────────────────────────────
 def run_full_pipeline(symbol: str,
                        backtest_config: dict | None = None,
-                       gate1_threshold: float = 0.48,
-                       gate2_threshold: float = 0.45,
-                       mc_threshold:   float = 0.40,
+                       gate1_threshold: float = MIN_WINRATE,
+                       gate2_threshold: float = WALK_FORWARD_MIN_WR,
+                       mc_threshold:   float = MONTE_CARLO_MIN_P5,
                        combo_top_n:    int   = 20,
                        verbose:        bool  = True) -> list[dict]:
     """
@@ -433,13 +447,7 @@ if __name__ == "__main__":
     print()
 
     SYMBOL = "NABIL"
-    BT_CONFIG = {
-        "stop_loss_pct":     5.0,
-        "take_profit_pct":  10.0,
-        "max_hold_days":    15,
-        "initial_capital":  100_000,
-        "position_size_pct": 10.0,
-    }
+    BT_CONFIG = {**DEFAULT_BACKTEST_CONFIG}
 
     # 1. Create table
     create_trading_rules_table()
@@ -465,9 +473,9 @@ if __name__ == "__main__":
     print(f"Running full pipeline for {SYMBOL}...")
     rules = run_full_pipeline(
         SYMBOL, BT_CONFIG,
-        gate1_threshold=0.48,
-        gate2_threshold=0.45,
-        mc_threshold=0.40,
+        gate1_threshold=MIN_WINRATE,
+        gate2_threshold=WALK_FORWARD_MIN_WR,
+        mc_threshold=MONTE_CARLO_MIN_P5,
         combo_top_n=15,
         verbose=True,
     )
