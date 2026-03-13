@@ -771,7 +771,33 @@ def top_movers():
     finally:
         conn.close()
 
-
+@app.route("/api/init-data", methods=["POST", "GET"])
+def init_data():
+    """Re-fetch all data after Railway restart."""
+    import threading
+    import sys
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    
+    def run():
+        try:
+            from data.fetcher import create_tables, fetch_company_list, fetch_all_price_histories
+            from data.cleaner import create_clean_table, clean_all_symbols
+            from signals.nepse_signals import create_signals_table, calculate_all_signals
+            create_tables()
+            fetch_company_list()
+            fetch_all_price_histories()
+            create_clean_table()
+            clean_all_symbols()
+            create_signals_table()
+            calculate_all_signals()
+        except Exception as e:
+            print(f"Init data error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    threading.Thread(target=run).start()
+    return jsonify({"status": "started", "message": "Data fetch running in background. Check /api/health for progress."})
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
