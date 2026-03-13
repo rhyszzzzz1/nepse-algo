@@ -90,9 +90,13 @@ def health():
         price_rows = 0; clean_rows = 0; companies = 0
     finally:
         conn.close()
+
+    env_vars = {k: v for k, v in os.environ.items() if "VOL" in k.upper() or "RAILWAY" in k.upper()}
+
     return jsonify({
         "status": "ok",
         "time": datetime.now().isoformat(),
+        "env": env_vars,
         "db": {
             "companies": companies,
             "price_rows": price_rows,
