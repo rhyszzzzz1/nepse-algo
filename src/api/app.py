@@ -341,6 +341,97 @@ def get_sectors():
         conn.close()
 
 
+# ── OPTIMIZER LEADERBOARD ─────────────────────────────────────────────────────
+@app.route("/api/optimizer/leaderboard")
+def optimizer_leaderboard():
+    """
+    Return the best indicator per symbol ranked by composite_score.
+    ?limit=N (default 50)
+    ?indicator_type=trend|momentum|volatility|volume  (optional filter)
+    """
+    conn = get_db()
+    try:
+        limit    = int(request.args.get("limit", 50))
+        ind_type = request.args.get("indicator_type", "").lower()
+
+        query  = "SELECT * FROM optimizer_best"
+        params = []
+        if ind_type in ("trend", "momentum", "volatility", "volume"):
+            query += " WHERE indicator_type = ?"
+            params.append(ind_type)
+        query += " ORDER BY composite_score DESC LIMIT ?"
+        params.append(limit)
+
+        rows = rows_to_list(conn.execute(query, params).fetchall())
+
+        # Indicator popularity summary
+        popularity = rows_to_list(conn.execute("""
+            SELECT best_indicator AS indicator, indicator_type AS type,
+                   COUNT(*) AS symbol_count,
+                   AVG(winrate) AS avg_winrate,
+                   AVG(total_return_pct) AS avg_return
+            FROM   optimizer_best
+            GROUP  BY best_indicator
+            ORDER  BY symbol_count DESC
+            LIMIT  15
+        """).fetchall())
+
+        # Type summary
+        type_summary = rows_to_list(conn.execute("""
+            SELECT indicator_type AS type,
+                   COUNT(*) AS symbols,
+                   AVG(winrate) AS avg_winrate,
+                   AVG(total_return_pct) AS avg_return,
+                   AVG(composite_score) AS avg_score
+            FROM   optimizer_best
+            GROUP  BY indicator_type
+            ORDER  BY avg_score DESC
+        """).fetchall())
+
+        return jsonify({
+            "count":        len(rows),
+            "leaderboard":  rows,
+            "popularity":   popularity,
+            "type_summary": type_summary,
+        })
+    finally:
+        conn.close()
+
+
+# ── OPTIMIZER SYMBOL DETAIL ───────────────────────────────────────────────────
+@app.route("/api/optimizer/<symbol>")
+def optimizer_symbol(symbol):
+    """
+    Return full optimizer results for one symbol — all indicator configs
+    tried, sorted by composite_score DESC.
+    """
+    conn = get_db()
+    try:
+        symbol = symbol.upper()
+
+        best = conn.execute(
+            "SELECT * FROM optimizer_best WHERE symbol = ?", (symbol,)
+        ).fetchone()
+
+        all_results = rows_to_list(conn.execute("""
+            SELECT indicator, indicator_type, total_trades, winning_trades,
+                   winrate, profit_factor, avg_win_pct, avg_loss_pct,
+                   max_drawdown, total_return_pct, consistency, composite_score
+            FROM   optimizer_results
+            WHERE  symbol = ?
+            ORDER  BY composite_score DESC
+        """, (symbol,)).fetchall())
+
+        return jsonify({
+            "symbol":      symbol,
+            "best":        dict(best) if best else {},
+            "all_results": all_results,
+            "count":       len(all_results),
+        })
+    finally:
+        conn.close()
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
@@ -359,5 +450,7 @@ if __name__ == "__main__":
     print("  GET /api/screener?signal=BUY&market_condition=bull&min_score=2")
     print("  GET /api/companies")
     print("  GET /api/sectors")
+    print("  GET /api/optimizer/leaderboard")
+    print("  GET /api/optimizer/<SYMBOL>")
     print()
     app.run(debug=True, port=5000, use_reloader=False)
