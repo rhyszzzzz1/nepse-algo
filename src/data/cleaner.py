@@ -207,28 +207,42 @@ def clean_symbol(symbol):
 
 
 # ── CLEAN ALL SYMBOLS ─────────────────────────────────────────────────────────
-def clean_all_symbols():
+def clean_all_symbols(max_workers=10):
     """
-    Fetch every symbol from the companies table and run clean_symbol() on each.
-    Prints a progress counter and a final summary.
+    Fetch every symbol from the companies table and run clean_symbol() on each
+    using parallel threads. Prints a progress counter and a final summary.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     conn = get_db()
     symbols = [r[0] for r in conn.execute("SELECT symbol FROM companies").fetchall()]
     conn.close()
 
     total = len(symbols)
-    print(f"\nCleaning {total} symbols...")
+    print(f"\nCleaning {total} symbols using {max_workers} parallel workers...")
     success, failed, total_rows = 0, 0, 0
+    completed = 0
 
-    for i, symbol in enumerate(symbols, 1):
-        print(f"[{i}/{total}] Cleaning {symbol}...", end=" ")
-        result = clean_symbol(symbol)
-        if result is not None:
-            success += 1
-            total_rows += len(result)
-        else:
-            failed += 1
-            print(f"  (no data)")
+    def process_one(symbol):
+        try:
+            result = clean_symbol(symbol)
+            return symbol, result
+        except:
+            return symbol, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_one, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol, result = future.result()
+            completed += 1
+            if result is not None:
+                success += 1
+                total_rows += len(result)
+            else:
+                failed += 1
+            
+            if completed % 20 == 0:
+                print(f"Progress: {completed}/{total} | Success: {success} | Failed: {failed}")
 
     print(f"\n[DONE] Cleaned {success} symbols | {failed} failed | {total_rows} total rows")
 

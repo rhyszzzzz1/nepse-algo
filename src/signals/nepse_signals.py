@@ -228,11 +228,13 @@ def calculate_signals_for(symbol):
 
 
 # ── CALCULATE ALL SIGNALS ─────────────────────────────────────────────────────
-def calculate_all_signals():
+def calculate_all_signals(max_workers=10):
     """
-    Run calculate_signals_for() for every symbol in clean_price_history.
-    Prints progress every 50 symbols and a final summary.
+    Run calculate_signals_for() for every symbol in clean_price_history
+    using parallel threads. Prints progress every 20 symbols and a final summary.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     conn = get_db()
     symbols = [r[0] for r in conn.execute(
         "SELECT DISTINCT symbol FROM clean_price_history"
@@ -240,18 +242,29 @@ def calculate_all_signals():
     conn.close()
 
     total = len(symbols)
-    print(f"Calculating NEPSE signals for {total} symbols...")
+    print(f"Calculating NEPSE signals for {total} symbols using {max_workers} parallel workers...")
     success, failed = 0, 0
+    completed = 0
 
-    for i, symbol in enumerate(symbols, 1):
-        result = calculate_signals_for(symbol)
-        if result is not None:
-            success += 1
-        else:
-            failed += 1
+    def process_one(symbol):
+        try:
+            result = calculate_signals_for(symbol)
+            return symbol, result is not None
+        except:
+            return symbol, False
 
-        if i % 50 == 0 or i == total:
-            print(f"  [{i}/{total}]  done={success}  failed={failed}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_one, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol, ok = future.result()
+            completed += 1
+            if ok:
+                success += 1
+            else:
+                failed += 1
+            
+            if completed % 20 == 0:
+                print(f"Progress: {completed}/{total} | Success: {success} | Failed: {failed}")
 
     print(f"\n[DONE] {success} symbols processed | {failed} skipped")
 

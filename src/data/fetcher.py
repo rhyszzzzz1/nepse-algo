@@ -201,7 +201,7 @@ def fetch_all_price_histories(max_workers=10):
     success, failed = 0, 0
     completed = 0
 
-    def fetch_one(symbol):
+    def process_one(symbol):
         try:
             result = fetch_price_history(symbol)
             return symbol, result is not None
@@ -209,7 +209,7 @@ def fetch_all_price_histories(max_workers=10):
             return symbol, False
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_one, symbol): symbol for symbol in symbols}
+        futures = {executor.submit(process_one, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol, ok = future.result()
             completed += 1
@@ -218,7 +218,7 @@ def fetch_all_price_histories(max_workers=10):
             else:
                 failed += 1
             if completed % 20 == 0:
-                print(f"   Progress: {completed}/{total} | Success: {success} | Failed: {failed}")
+                print(f"Progress: {completed}/{total} | Success: {success} | Failed: {failed}")
 
     print(f"\n✅ Done. Success: {success} | Failed: {failed}")
 # ── FETCH FLOOR SHEET ─────────────────────────────────────────────────────────
