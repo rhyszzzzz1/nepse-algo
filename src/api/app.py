@@ -664,6 +664,54 @@ def init_status():
     return jsonify(_init_status)
 
 
+# ── UPLOAD DB (one-time) ───────────────────────────────────────────────────────
+@app.route("/api/upload-db", methods=["POST"])
+def upload_db():
+    """
+    Upload a pre-populated SQLite database directly to the volume.
+    Requires header: X-Upload-Token: nepse-upload-2026
+    Usage: curl -X POST -H 'X-Upload-Token: nepse-upload-2026' \
+                --data-binary @nepse.db \
+                https://.../api/upload-db
+    """
+    if request.headers.get("X-Upload-Token") != "nepse-upload-2026":
+        return jsonify({"error": "Unauthorized"}), 401
+
+    from db import DB_PATH
+    import shutil
+
+    tmp_path = DB_PATH + ".tmp"
+    try:
+        data = request.get_data()
+        if len(data) < 1024:
+            return jsonify({"error": "File too small — did the upload work?"}), 400
+
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+
+        # Validate it's a real SQLite DB
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(tmp_path)
+        companies = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+        price_rows = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+        conn.close()
+
+        shutil.move(tmp_path, DB_PATH)
+
+        return jsonify({
+            "status": "ok",
+            "db_path": DB_PATH,
+            "size_mb": round(len(data) / 1024 / 1024, 1),
+            "companies": companies,
+            "price_rows": price_rows,
+        })
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return jsonify({"error": str(e)}), 500
+
+
 # ── BACKGROUND JOB TRACKER ────────────────────────────────────────────────────
 import threading
 _jobs: dict = {}
