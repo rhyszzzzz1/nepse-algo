@@ -507,27 +507,249 @@ def get_rules_summary():
         conn.close()
 
 
+# ── BACKGROUND JOB TRACKER ────────────────────────────────────────────────────
+import threading
+
+_jobs: dict = {}   # job_id -> {'status', 'symbol', 'result', 'error'}
+_job_lock = threading.Lock()
+
+
+def _job_id(symbol: str) -> str:
+    return f"backtest_{symbol.upper()}"
+
+
+# ── PRICE ALIAS ───────────────────────────────────────────────────────────────
+@app.route("/api/price/<symbol>")
+def get_price(symbol):
+    """
+    Return last ?days=90 rows from clean_price_history for *symbol*.
+    Shape matches the Lovable frontend expectation.
+    """
+    conn = get_db()
+    try:
+        symbol = symbol.upper()
+        days   = int(request.args.get("days", 90))
+
+        rows = conn.execute("""
+            SELECT date, open, high, low, close, volume, market_condition
+            FROM   clean_price_history
+            WHERE  symbol = ?
+            ORDER  BY date DESC LIMIT ?
+        """, (symbol, days)).fetchall()
+
+        if not rows:
+            return jsonify({"error": f"Symbol '{symbol}' not found"}), 404
+
+        data = [
+            {"date": r[0], "open": r[1], "high": r[2], "low": r[3],
+             "close": r[4], "volume": r[5], "market_condition": r[6]}
+            for r in reversed(rows)
+        ]
+        return jsonify({"symbol": symbol, "days": len(data), "prices": data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── NEPSE SIGNALS FOR ONE SYMBOL ──────────────────────────────────────────────
+@app.route("/api/signals/<symbol>")
+def get_nepse_signals_for_symbol(symbol):
+    """
+    Return the latest nepse_signals row for *symbol*
+    (pump_score, dump_score, broker_accumulation_pct, liquidity_spike, etc.)
+    """
+    conn = get_db()
+    try:
+        symbol = symbol.upper()
+
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if "nepse_signals" not in tables:
+            return jsonify({"error": "nepse_signals table not found"}), 404
+
+        row = conn.execute("""
+            SELECT *
+            FROM   nepse_signals
+            WHERE  symbol = ?
+            ORDER  BY date DESC LIMIT 1
+        """, (symbol,)).fetchone()
+
+        if not row:
+            return jsonify({"error": f"No nepse signals for '{symbol}'"}), 404
+
+        return jsonify({"symbol": symbol, "signals": dict(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── POST /api/run-backtest (background thread) ────────────────────────────────
+@app.route("/api/run-backtest", methods=["POST"])
+def run_backtest_endpoint():
+    """
+    Kick off a full pipeline run for a symbol in a background thread.
+    Body JSON: { symbol, stop_loss_pct, take_profit_pct, max_hold_days }
+    Poll GET /api/run-backtest/<symbol> to check status.
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        symbol = str(body.get("symbol", "")).upper()
+        if not symbol:
+            return jsonify({"error": "symbol is required"}), 400
+
+        sl   = float(body.get("stop_loss_pct",   5.0))
+        tp   = float(body.get("take_profit_pct", 10.0))
+        hold = int(body.get("max_hold_days",     15))
+
+        job_id = _job_id(symbol)
+        with _job_lock:
+            if _jobs.get(job_id, {}).get("status") == "running":
+                return jsonify({"status": "already_running",
+                                "job_id": job_id,
+                                "message": f"Pipeline for {symbol} already running"}), 409
+            _jobs[job_id] = {"status": "running", "symbol": symbol,
+                             "result": None, "error": None}
+
+        def _run():
+            import sys, os
+            ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, os.path.join(ROOT, "src"))
+            try:
+                from engine.scorer import run_full_pipeline
+                cfg = {
+                    "stop_loss_pct":     sl,
+                    "take_profit_pct":   tp,
+                    "max_hold_days":     hold,
+                    "initial_capital":   100_000,
+                    "position_size_pct": 10.0,
+                }
+                rules = run_full_pipeline(symbol, cfg, verbose=False)
+                with _job_lock:
+                    _jobs[job_id]["status"] = "done"
+                    _jobs[job_id]["result"] = {
+                        "rules_saved": len(rules),
+                        "top_rule":    rules[0]["rule_name"] if rules else None,
+                        "top_score":   rules[0]["weighted_score"] if rules else None,
+                    }
+            except Exception as e:
+                with _job_lock:
+                    _jobs[job_id]["status"] = "error"
+                    _jobs[job_id]["error"]  = str(e)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        return jsonify({
+            "status":  "running",
+            "job_id":  job_id,
+            "symbol":  symbol,
+            "message": f"Full pipeline started for {symbol} "
+                       f"(SL={sl}% TP={tp}% hold={hold}d). "
+                       f"Poll GET /api/run-backtest/{symbol} for status.",
+        }), 202
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/run-backtest/<symbol>")
+def get_backtest_job_status(symbol):
+    """Poll the status of a background pipeline job."""
+    job_id = _job_id(symbol)
+    with _job_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"status": "not_found",
+                        "message": f"No job found for {symbol.upper()}"}), 404
+    return jsonify(job)
+
+
+# ── MARKET SUMMARY ALIAS ──────────────────────────────────────────────────────
+@app.route("/api/market-summary")
+def market_summary_simple():
+    """Return the latest market_summary row (simple alias of /api/market/overview)."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM market_summary ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        return jsonify({"market_summary": dict(row) if row else {}})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── TOP MOVERS ────────────────────────────────────────────────────────────────
+@app.route("/api/top-movers")
+def top_movers():
+    """
+    Return top 5 gainers and top 5 losers based on the latest trading day's
+    price_change_pct from clean_price_history.
+    """
+    conn = get_db()
+    try:
+        latest_date = conn.execute(
+            "SELECT MAX(date) FROM clean_price_history"
+        ).fetchone()[0]
+
+        if not latest_date:
+            return jsonify({"date": None, "gainers": [], "losers": []}), 200
+
+        gainers = rows_to_list(conn.execute("""
+            SELECT symbol, close, price_change_pct, volume, market_condition
+            FROM   clean_price_history
+            WHERE  date = ? AND price_change_pct IS NOT NULL
+            ORDER  BY price_change_pct DESC LIMIT 5
+        """, (latest_date,)).fetchall())
+
+        losers = rows_to_list(conn.execute("""
+            SELECT symbol, close, price_change_pct, volume, market_condition
+            FROM   clean_price_history
+            WHERE  date = ? AND price_change_pct IS NOT NULL
+            ORDER  BY price_change_pct ASC LIMIT 5
+        """, (latest_date,)).fetchall())
+
+        return jsonify({
+            "date":    latest_date,
+            "gainers": gainers,
+            "losers":  losers,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
-    print("NEPSE API Server - Step 7")
+    print("NEPSE API Server")
     print("=" * 55)
     print("Starting Flask on http://localhost:5000")
     print()
     print("Endpoints:")
-    print("  GET /api/health")
-    print("  GET /api/market/overview")
-    print("  GET /api/signals?signal=BUY&limit=20")
-    print("  GET /api/stock/<SYMBOL>")
-    print("  GET /api/stock/<SYMBOL>/ohlcv")
-    print("  GET /api/backtest")
-    print("  GET /api/backtest/<SYMBOL>")
-    print("  GET /api/screener?signal=BUY&market_condition=bull&min_score=2")
-    print("  GET /api/companies")
-    print("  GET /api/sectors")
-    print("  GET /api/optimizer/leaderboard")
-    print("  GET /api/optimizer/<SYMBOL>")
-    print("  GET /api/rules/<SYMBOL>")
-    print("  GET /api/rules")
+    print("  GET  /api/health")
+    print("  GET  /api/market/overview")
+    print("  GET  /api/market-summary")
+    print("  GET  /api/top-movers")
+    print("  GET  /api/signals?signal=BUY&limit=20")
+    print("  GET  /api/signals/<SYMBOL>        (nepse signals)")
+    print("  GET  /api/price/<SYMBOL>?days=90")
+    print("  GET  /api/stock/<SYMBOL>")
+    print("  GET  /api/stock/<SYMBOL>/ohlcv")
+    print("  GET  /api/backtest")
+    print("  GET  /api/backtest/<SYMBOL>")
+    print("  POST /api/run-backtest            (background pipeline)")
+    print("  GET  /api/run-backtest/<SYMBOL>   (poll job status)")
+    print("  GET  /api/screener?signal=BUY&market_condition=bull&min_score=2")
+    print("  GET  /api/companies")
+    print("  GET  /api/sectors")
+    print("  GET  /api/optimizer/leaderboard")
+    print("  GET  /api/optimizer/<SYMBOL>")
+    print("  GET  /api/rules/<SYMBOL>")
+    print("  GET  /api/rules")
     print()
     app.run(debug=True, port=5000, use_reloader=False)
