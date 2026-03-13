@@ -1,6 +1,11 @@
 # src/api/app.py
-import sys
 import os
+import sys
+
+# Must happen before any other imports — force SQLite
+os.environ["DATABASE_URL"] = ""
+os.environ.pop("DATABASE_URL", None)
+os.environ.pop("POSTGRES_URL", None)
 
 # Fix import paths for Railway
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,12 +16,6 @@ import sqlite3
 from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import sqlite3
-import os
-
-# Force SQLite — ignore any PostgreSQL environment variables
-os.environ.pop("DATABASE_URL", None)
-os.environ.pop("POSTGRES_URL", None)
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
