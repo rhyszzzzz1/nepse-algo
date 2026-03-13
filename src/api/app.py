@@ -2,7 +2,10 @@
 # Step 7: NEPSE Flask REST API
 # Serves all data (signals, backtests, prices, sectors, market summary)
 # to the frontend dashboard via clean JSON endpoints.
-
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import sqlite3
 from db import get_db
 import os
