@@ -4,6 +4,7 @@
 # to the frontend dashboard via clean JSON endpoints.
 
 import sqlite3
+from db import get_db
 import os
 from datetime import datetime
 from flask import Flask, jsonify, request
@@ -15,7 +16,7 @@ CORS(app)
 try:
     import sys as _sys
     _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-    from config import (DB_PATH, API_PORT, FLASK_DEBUG,
+    from config import (API_PORT, FLASK_DEBUG,
                         DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
                         DEFAULT_MAX_HOLD_DAYS, DEFAULT_INITIAL_CAPITAL,
                         DEFAULT_POSITION_SIZE_PCT)
@@ -29,10 +30,10 @@ except ImportError:
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row   # rows behave like dicts
+    from db import get_db as _get_db
+    conn = _get_db()
+    conn.row_factory = True
     return conn
-
 
 def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]

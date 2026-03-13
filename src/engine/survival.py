@@ -12,6 +12,7 @@
 import os
 import sys
 import sqlite3
+from db import get_db
 
 import numpy as np
 import pandas as pd
@@ -30,7 +31,7 @@ from engine.backtester import run_backtest, DEFAULT_CONFIG
 from engine.indicators import generate_signals
 
 try:
-    from config import (DB_PATH, DEFAULT_BACKTEST_CONFIG,
+    from config import (DEFAULT_BACKTEST_CONFIG,
                         MIN_WINRATE, WALK_FORWARD_MIN_WR,
                         MONTE_CARLO_RUNS, MONTE_CARLO_MIN_P5)
 except ImportError:
@@ -43,12 +44,10 @@ except ImportError:
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
-def _get_db():
-    return sqlite3.connect(DB_PATH)
 
 
 def _load_symbol(symbol: str) -> pd.DataFrame | None:
-    conn = _get_db()
+    conn = get_db()
     try:
         df = pd.read_sql_query("""
             SELECT date, open, high, low, close, volume,

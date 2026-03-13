@@ -5,6 +5,7 @@
 # Uses the 'ta' library (NOT pandas_ta).
 
 import sqlite3
+from db import get_db
 import os
 import traceback
 from datetime import datetime
@@ -17,11 +18,6 @@ DB_PATH = "data/nepse.db"
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
-def get_db():
-    """Return a SQLite connection to the project database."""
-    os.makedirs("data", exist_ok=True)
-    return sqlite3.connect(DB_PATH)
-
 
 # ── CREATE TABLE ──────────────────────────────────────────────────────────────
 def create_clean_table():

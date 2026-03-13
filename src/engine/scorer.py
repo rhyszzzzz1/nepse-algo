@@ -12,6 +12,7 @@
 import os
 import sys
 import sqlite3
+from db import get_db
 import json
 from datetime import datetime
 
@@ -36,7 +37,7 @@ from engine.combinations import (build_combinations, generate_combination_signal
                                   _load_symbol, _load_nepse_signals)
 
 try:
-    from config import (DB_PATH, DEFAULT_BACKTEST_CONFIG,
+    from config import (DEFAULT_BACKTEST_CONFIG,
                         WEIGHT_WINRATE, WEIGHT_PROFIT_FACTOR,
                         WEIGHT_CONSISTENCY, WEIGHT_DRAWDOWN,
                         PROFIT_FACTOR_CAP,
@@ -53,13 +54,11 @@ except ImportError:
 
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
-def _get_db():
-    return sqlite3.connect(DB_PATH)
 
 
 def create_trading_rules_table():
     """Create the trading_rules table if it does not exist."""
-    conn = _get_db()
+    conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trading_rules (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,7 +152,7 @@ def save_rule(symbol:           str,
 
     rule_name = indicator_config.get("name", "unknown")
 
-    conn = _get_db()
+    conn = get_db()
     try:
         cursor = conn.execute("""
             INSERT OR REPLACE INTO trading_rules
@@ -332,7 +331,7 @@ def get_top_rules(symbol: str, limit: int = 10) -> list[dict]:
     Return the top *limit* rules for *symbol* from trading_rules,
     sorted by weighted_score DESC.
     """
-    conn = _get_db()
+    conn = get_db()
     try:
         rows = conn.execute("""
             SELECT id, symbol, rule_name, rule_type,
@@ -375,7 +374,7 @@ def get_top_rules(symbol: str, limit: int = 10) -> list[dict]:
 
 def get_rules_summary():
     """Print and return a summary of trading_rules across all symbols."""
-    conn = _get_db()
+    conn = get_db()
     try:
         tables = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -490,7 +489,7 @@ if __name__ == "__main__":
     get_rules_summary()
 
     # 6. DB count
-    conn = _get_db()
+    conn = get_db()
     n = conn.execute("SELECT COUNT(*) FROM trading_rules WHERE symbol=?",
                      (SYMBOL,)).fetchone()[0]
     conn.close()

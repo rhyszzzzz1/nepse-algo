@@ -15,6 +15,7 @@
 #   4. End-of-data: exit at last close
 
 import sqlite3
+from db import get_db
 import os
 import traceback
 from datetime import datetime
@@ -38,9 +39,6 @@ DEFAULT_CONFIG = {
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
-def get_db():
-    os.makedirs("data", exist_ok=True)
-    return sqlite3.connect(DB_PATH)
 
 
 # ── METRICS ───────────────────────────────────────────────────────────────────

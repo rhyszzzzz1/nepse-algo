@@ -15,6 +15,7 @@
 # Signal label: BUY (score >= 2), SELL (score <= -2), HOLD otherwise
 
 import sqlite3
+from db import get_db
 import os
 import traceback
 from datetime import datetime
@@ -28,9 +29,6 @@ MIN_ROWS  = 30   # minimum clean rows needed to generate a signal
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
-def get_db():
-    os.makedirs("data", exist_ok=True)
-    return sqlite3.connect(DB_PATH)
 
 
 # ── CREATE TABLE ──────────────────────────────────────────────────────────────

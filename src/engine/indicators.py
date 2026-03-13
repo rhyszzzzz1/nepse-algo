@@ -5,6 +5,7 @@
 
 import itertools
 import sqlite3
+from db import get_db
 import os
 import traceback
 
@@ -16,9 +17,6 @@ import ta
 DB_PATH = "data/nepse.db"
 
 
-def get_db():
-    os.makedirs("data", exist_ok=True)
-    return sqlite3.connect(DB_PATH)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

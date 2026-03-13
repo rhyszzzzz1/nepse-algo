@@ -6,6 +6,7 @@
 from nepse import Nepse
 import pandas as pd
 import sqlite3
+from db import get_db
 import os
 from datetime import datetime
 
@@ -19,10 +20,6 @@ def get_nepse():
     nepse.setTLSVerification(False)
     return nepse
 
-def get_db():
-    """Return SQLite connection, create data folder if needed."""
-    os.makedirs("data", exist_ok=True)
-    return sqlite3.connect(DB_PATH)
 
 # ── CREATE TABLES ─────────────────────────────────────────────────────────────
 def create_tables():

@@ -5,6 +5,7 @@
 # liquidity spikes, and volatility regime classification.
 
 import sqlite3
+from db import get_db
 import os
 import traceback
 from datetime import datetime
@@ -18,9 +19,6 @@ MIN_ROWS = 20   # minimum clean rows required to calculate signals
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
-def get_db():
-    os.makedirs("data", exist_ok=True)
-    return sqlite3.connect(DB_PATH)
 
 
 # ── CREATE TABLE ──────────────────────────────────────────────────────────────

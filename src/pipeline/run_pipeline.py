@@ -111,12 +111,11 @@ def step4_nepse():
 def step5_backtest(symbols=None):
     """Run backtests for all (or specified) symbols."""
     header("Step 5: Backtest all symbols")
-    import sqlite3
+    from db import get_db
     from engine.backtester import backtest_indicator, DEFAULT_CONFIG
     from engine.indicators import get_all_indicator_configs
 
-    db = os.path.join(ROOT, "data", "nepse.db")
-    conn = sqlite3.connect(db)
+    conn = get_db()
 
     if symbols:
         syms = symbols
@@ -153,12 +152,8 @@ def step6_optimize(limit=None):
 
 def print_signal_report():
     """Print today's top BUY signals as a quick summary."""
-    import sqlite3
-    db = os.path.join(ROOT, "data", "nepse.db")
-    if not os.path.exists(db):
-        print("  DB not found:", db)
-        return
-    conn = sqlite3.connect(db)
+    from db import get_db
+    conn = get_db()
 
     try:
         tables = [r[0] for r in conn.execute(

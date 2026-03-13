@@ -11,6 +11,7 @@
 import os
 import sys
 import sqlite3
+from db import get_db
 import itertools
 
 import numpy as np
@@ -35,12 +36,10 @@ DB_PATH = os.path.join(ROOT, "data", "nepse.db")
 
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
-def _get_db():
-    return sqlite3.connect(DB_PATH)
 
 
 def _load_symbol(symbol: str) -> pd.DataFrame | None:
-    conn = _get_db()
+    conn = get_db()
     try:
         df = pd.read_sql_query("""
             SELECT date, open, high, low, close, volume,
@@ -56,7 +55,7 @@ def _load_symbol(symbol: str) -> pd.DataFrame | None:
 
 def _load_nepse_signals(symbol: str) -> pd.DataFrame | None:
     """Load NEPSE-specific signal rows for *symbol* (from nepse_signals table)."""
-    conn = _get_db()
+    conn = get_db()
     try:
         tables = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -85,7 +84,7 @@ def load_top_survivors_from_db(symbol: str, top_n: int = 20) -> list[dict]:
     """
     from engine.indicators import get_all_indicator_configs
 
-    conn = _get_db()
+    conn = get_db()
     try:
         tables = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"

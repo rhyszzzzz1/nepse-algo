@@ -13,6 +13,7 @@
 # (winrate alone is misleading when n_trades is tiny)
 
 import sqlite3
+from db import get_db
 import os
 import sys
 import traceback
@@ -33,7 +34,7 @@ from engine.indicators  import get_all_indicator_configs
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 try:
-    from config import DB_PATH, DEFAULT_BACKTEST_CONFIG as BACKTEST_CONFIG
+    from config import DEFAULT_BACKTEST_CONFIG as BACKTEST_CONFIG
 except ImportError:
     _ROOT3 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     DB_PATH = os.path.join(_ROOT3, "data", "nepse.db")
@@ -49,9 +50,6 @@ MIN_TRADES = 3   # discard configs with fewer trades (statistically meaningless)
 
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
-def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    return sqlite3.connect(DB_PATH)
 
 
 def create_tables():
