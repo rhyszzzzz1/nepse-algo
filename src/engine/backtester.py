@@ -1,36 +1,40 @@
 # src/engine/backtester.py
-# Step 6: NEPSE Backtester
-# Simulates a rule-based trading strategy driven by signals from the signals
-# table.  Applies NEPSE-specific T+2 settlement (cannot sell within 2 trading
-# days of purchase), realistic commission (0.4% buy + 0.4% sell), and
-# generates detailed trade logs and performance metrics.
+# Step 7: NEPSE Backtester — full T+2-compliant signal-driven simulation
 #
-# Strategy:
-#   - BUY  when signal == 'BUY'  and no open position exists for the symbol
-#   - SELL when signal == 'SELL' and an open position has cleared T+2
-#   - Close remaining positions at the last available price at end of backtest
+# T+2 SETTLEMENT (critical):
+#   BUY signal on row i
+#   → Entry at OPEN of row i+1  (next trading day)
+#   → Position LOCKED until row i+3  (2 full trading days after entry)
+#   → First possible exit: row i+3 onwards
+#   Stop-loss / take-profit CANNOT fire on rows i+1 or i+2.
 #
-# Position sizing: equal-weight, configurable capital per trade (default 10k NPR)
-# Results stored in:
-#   backtest_trades  — one row per completed trade
-#   backtest_summary — one row per backtest run (performance metrics)
+# Exit priority (checked each day from lock_until onwards):
+#   1. Stop-loss  : close <= entry * (1 - sl%)
+#   2. Take-profit: close >= entry * (1 + tp%)
+#   3. Time-stop  : days_held >= max_hold_days
+#   4. End-of-data: exit at last close
 
 import sqlite3
 import os
 import traceback
-import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from engine.indicators import get_all_indicator_configs, generate_signals
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-DB_PATH          = "data/nepse.db"
-DEFAULT_CAPITAL  = 100_000   # NPR — total starting capital
-CAPITAL_PER_TRADE = 10_000   # NPR — amount deployed per trade
-BUY_COMMISSION   = 0.004     # 0.4%
-SELL_COMMISSION  = 0.004     # 0.4%
-T2_DAYS          = 2         # minimum holding days before sell allowed
+DB_PATH = "data/nepse.db"
+
+DEFAULT_CONFIG = {
+    "stop_loss_pct":     5.0,
+    "take_profit_pct":  10.0,
+    "max_hold_days":    15,
+    "initial_capital":  100_000,
+    "position_size_pct": 10.0,
+}
 
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
@@ -39,107 +43,35 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
-# ── CREATE TABLES ─────────────────────────────────────────────────────────────
-def create_backtest_tables():
-    conn = get_db()
+# ── METRICS ───────────────────────────────────────────────────────────────────
+def _calc_metrics(trades: list, initial_capital: float) -> dict:
+    if not trades:
+        return {
+            "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
+            "winrate": 0.0, "profit_factor": 0.0,
+            "avg_win_pct": 0.0, "avg_loss_pct": 0.0,
+            "max_drawdown": 0.0, "total_return_pct": 0.0,
+            "final_capital": initial_capital, "consistency": 0.0,
+        }
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS backtest_trades (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id         TEXT NOT NULL,
-            symbol         TEXT NOT NULL,
-            buy_date       TEXT NOT NULL,
-            sell_date      TEXT,
-            buy_price      REAL,
-            sell_price     REAL,
-            shares         REAL,
-            gross_profit   REAL,
-            commission     REAL,
-            net_profit     REAL,
-            return_pct     REAL,
-            holding_days   INTEGER,
-            exit_reason    TEXT,
-            created_at     TEXT
-        )
-    """)
+    winners = [t for t in trades if t["pnl_amount"] > 0]
+    losers  = [t for t in trades if t["pnl_amount"] <= 0]
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS backtest_summary (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id          TEXT NOT NULL UNIQUE,
-            symbol_filter   TEXT,
-            start_date      TEXT,
-            end_date        TEXT,
-            starting_capital REAL,
-            ending_capital   REAL,
-            total_return_pct REAL,
-            total_trades    INTEGER,
-            winning_trades  INTEGER,
-            losing_trades   INTEGER,
-            win_rate_pct    REAL,
-            avg_return_pct  REAL,
-            best_trade_pct  REAL,
-            worst_trade_pct REAL,
-            max_drawdown_pct REAL,
-            sharpe_ratio    REAL,
-            created_at      TEXT
-        )
-    """)
+    gross_profit = sum(t["pnl_amount"] for t in winners)
+    gross_loss   = abs(sum(t["pnl_amount"] for t in losers))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    conn.commit()
-    conn.close()
-    print("[OK] backtest tables ready")
+    avg_win  = float(np.mean([t["pnl_pct"] for t in winners])) if winners else 0.0
+    avg_loss = float(np.mean([t["pnl_pct"] for t in losers]))  if losers  else 0.0
 
+    # Equity curve for drawdown
+    equity = initial_capital
+    equity_curve = [equity]
+    for t in trades:
+        equity += t["pnl_amount"]
+        equity_curve.append(equity)
 
-# ── TRADING DAY HELPERS ───────────────────────────────────────────────────────
-def _get_trading_dates(conn, symbol=None):
-    """Return a sorted list of all trading dates in clean_price_history."""
-    if symbol:
-        rows = conn.execute(
-            "SELECT DISTINCT date FROM clean_price_history WHERE symbol=? ORDER BY date",
-            (symbol,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT DISTINCT date FROM clean_price_history ORDER BY date"
-        ).fetchall()
-    return [r[0] for r in rows]
-
-
-def _earliest_sell_date(buy_date, all_dates):
-    """
-    Return the earliest date on which a position bought on *buy_date* can be
-    sold, respecting T+2 settlement (2 trading days must pass).
-    """
-    try:
-        idx = all_dates.index(buy_date)
-    except ValueError:
-        return None
-    sell_idx = idx + T2_DAYS
-    if sell_idx >= len(all_dates):
-        return None
-    return all_dates[sell_idx]
-
-
-# ── METRICS HELPERS ───────────────────────────────────────────────────────────
-def _sharpe(returns, risk_free=0.0):
-    """Annualised Sharpe ratio from a list of per-trade return %."""
-    if len(returns) < 2:
-        return 0.0
-    arr = np.array(returns, dtype=float)
-    mu  = arr.mean() - risk_free
-    sd  = arr.std(ddof=1)
-    if sd == 0:
-        return 0.0
-    # approx annual: assume ~252 trading days, trades are ~daily observations
-    return round(float(mu / sd * np.sqrt(252)), 4)
-
-
-def _max_drawdown(equity_curve):
-    """Max drawdown % from a list of equity values."""
-    arr = np.array(equity_curve, dtype=float)
-    if len(arr) < 2:
-        return 0.0
+    arr  = np.array(equity_curve)
     peak = arr[0]
     max_dd = 0.0
     for val in arr:
@@ -148,315 +80,332 @@ def _max_drawdown(equity_curve):
         dd = (peak - val) / peak * 100 if peak > 0 else 0.0
         if dd > max_dd:
             max_dd = dd
-    return round(max_dd, 4)
+
+    final_capital    = equity_curve[-1]
+    total_return_pct = (final_capital - initial_capital) / initial_capital * 100
+
+    # Consistency: % of calendar quarters with positive PnL
+    quarter_pnl: dict = {}
+    for t in trades:
+        try:
+            d = pd.Timestamp(t["exit_date"])
+            q = f"{d.year}Q{d.quarter}"
+            quarter_pnl[q] = quarter_pnl.get(q, 0.0) + t["pnl_amount"]
+        except Exception:
+            pass
+    profitable_quarters = sum(1 for v in quarter_pnl.values() if v > 0)
+    consistency = (profitable_quarters / len(quarter_pnl) * 100
+                   if quarter_pnl else 0.0)
+
+    return {
+        "total_trades":      len(trades),
+        "winning_trades":    len(winners),
+        "losing_trades":     len(losers),
+        "winrate":           round(len(winners) / len(trades) * 100, 2),
+        "profit_factor":     round(profit_factor, 4),
+        "avg_win_pct":       round(avg_win,   4),
+        "avg_loss_pct":      round(avg_loss,  4),
+        "max_drawdown":      round(max_dd,    4),
+        "total_return_pct":  round(total_return_pct, 4),
+        "final_capital":     round(final_capital, 2),
+        "consistency":       round(consistency, 2),
+    }
 
 
-# ── BACKTEST ONE SYMBOL ───────────────────────────────────────────────────────
-def backtest_symbol(symbol, start_date=None, end_date=None,
-                    capital=DEFAULT_CAPITAL,
-                    capital_per_trade=CAPITAL_PER_TRADE):
+# ── CORE BACKTEST ENGINE ──────────────────────────────────────────────────────
+def run_backtest(df: pd.DataFrame, signal_series: pd.Series, config: dict) -> dict:
     """
-    Backtest the signal strategy for a single symbol.
-    Returns a dict of performance metrics, or None if insufficient data.
+    Simulate trades on historical OHLCV data driven by *signal_series*.
+
+    Parameters
+    ----------
+    df            : clean_price_history DataFrame with columns
+                    [date, open, high, low, close, volume, ...]
+    signal_series : integer Series aligned with df index — 1=BUY, -1=SELL, 0=HOLD
+    config        : backtest config dict (see DEFAULT_CONFIG)
+
+    Returns
+    -------
+    dict with keys 'trades' (list of dicts) and 'metrics' (dict).
     """
+    sl_pct    = config.get("stop_loss_pct",     DEFAULT_CONFIG["stop_loss_pct"])
+    tp_pct    = config.get("take_profit_pct",   DEFAULT_CONFIG["take_profit_pct"])
+    max_hold  = config.get("max_hold_days",      DEFAULT_CONFIG["max_hold_days"])
+    capital   = float(config.get("initial_capital",   DEFAULT_CONFIG["initial_capital"]))
+    size_pct  = config.get("position_size_pct", DEFAULT_CONFIG["position_size_pct"])
+
+    # Reset to positional index for easy slicing
+    df = df.reset_index(drop=True)
+    sigs = signal_series.reset_index(drop=True)
+
+    opens  = df["open"].values
+    closes = df["close"].values
+    dates  = df["date"].values
+    n      = len(df)
+
+    trades: list = []
+    in_position = False   # only one open position at a time
+
+    sl_mul = 1.0 - sl_pct  / 100.0
+    tp_mul = 1.0 + tp_pct  / 100.0
+
+    for i in range(n):
+        # Skip if already holding a position
+        if in_position:
+            continue
+
+        if sigs.iloc[i] != 1:   # not a BUY signal
+            continue
+
+        # ── Entry (next-day open) ─────────────────────────────────────────────
+        entry_idx = i + 1
+        if entry_idx >= n:
+            break                    # no next day to enter
+
+        entry_price = opens[entry_idx]
+        if entry_price <= 0:
+            continue
+
+        entry_date = dates[entry_idx]
+        invest     = capital * (size_pct / 100.0)
+        invest     = min(invest, capital * 0.95)  # never use more than 95% of capital
+        if invest < 10:
+            continue
+
+        shares = invest / entry_price
+        in_position = True
+
+        # ── T+2 lock — first exit allowed at entry_idx + 2 ───────────────────
+        lock_until = entry_idx + 2   # rows i+1 (entry) and i+2 are locked
+        exit_idx   = None
+        exit_reason = "END_OF_DATA"
+
+        for j in range(lock_until, n):
+            days_held = j - entry_idx
+            c = closes[j]
+
+            if c <= entry_price * sl_mul:
+                exit_idx    = j
+                exit_reason = "STOP_LOSS"
+                break
+            if c >= entry_price * tp_mul:
+                exit_idx    = j
+                exit_reason = "TAKE_PROFIT"
+                break
+            if days_held >= max_hold:
+                exit_idx    = j
+                exit_reason = "TIME_STOP"
+                break
+
+        if exit_idx is None:
+            exit_idx    = n - 1
+            exit_reason = "END_OF_DATA"
+
+        exit_price = closes[exit_idx]
+        exit_date  = dates[exit_idx]
+        days_held  = exit_idx - entry_idx
+
+        gross    = (exit_price - entry_price) * shares
+        # Simple commission: 0.4% each side
+        comm     = invest * 0.004 + exit_price * shares * 0.004
+        net      = gross - comm
+        pnl_pct  = net / invest * 100
+
+        capital += net
+        in_position = False
+
+        trades.append({
+            "entry_date":   str(entry_date),
+            "exit_date":    str(exit_date),
+            "entry_price":  round(float(entry_price),  2),
+            "exit_price":   round(float(exit_price),   2),
+            "shares":       round(float(shares),        4),
+            "invested":     round(float(invest),        2),
+            "gross":        round(float(gross),         2),
+            "commission":   round(float(comm),          2),
+            "pnl_amount":   round(float(net),           2),
+            "pnl_pct":      round(float(pnl_pct),       4),
+            "days_held":    int(days_held),
+            "exit_reason":  exit_reason,
+        })
+
+    metrics = _calc_metrics(trades, float(config.get("initial_capital",
+                                                      DEFAULT_CONFIG["initial_capital"])))
+    return {"trades": trades, "metrics": metrics}
+
+
+# ── BACKTEST ONE INDICATOR FOR ONE SYMBOL ─────────────────────────────────────
+def backtest_indicator(symbol: str, indicator_config: dict,
+                       backtest_config: dict | None = None) -> dict | None:
+    """
+    Load clean_price_history for *symbol*, generate signals with
+    *indicator_config*, run run_backtest(), and return the full result dict.
+
+    Returns None if there is not enough data.
+    """
+    if backtest_config is None:
+        backtest_config = DEFAULT_CONFIG.copy()
+
     conn = get_db()
     try:
-        # Load signals joined with price data
-        query = """
-            SELECT s.date, s.close, s.signal, s.total_score,
-                   s.market_condition, c.high, c.low
-            FROM   signals s
-            JOIN   clean_price_history c
-              ON   s.symbol = c.symbol AND s.date = c.date
-            WHERE  s.symbol = ?
-        """
-        params = [symbol]
-        if start_date:
-            query += " AND s.date >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND s.date <= ?"
-            params.append(end_date)
-        query += " ORDER BY s.date ASC"
-
-        df = pd.read_sql_query(query, conn, params=params)
-        if df.empty or len(df) < 10:
-            return None
-
-        all_dates = df["date"].tolist()
-
-        cash        = float(capital)
-        position    = None    # {buy_date, buy_price, shares, cost_basis}
-        trades      = []
-        equity_curve = [cash]
-
-        for _, row in df.iterrows():
-            date     = row["date"]
-            price    = float(row["close"])
-            signal   = row["signal"]
-
-            # -- SELL logic ---------------------------------------------------
-            if position is not None:
-                earliest = _earliest_sell_date(position["buy_date"], all_dates)
-                can_sell = (earliest is not None and date >= earliest)
-
-                if can_sell and (signal == "SELL" or row["total_score"] <= -2):
-                    sell_price = price
-                    gross      = (sell_price - position["buy_price"]) * position["shares"]
-                    commission = (position["cost_basis"] * BUY_COMMISSION +
-                                  sell_price * position["shares"] * SELL_COMMISSION)
-                    net        = gross - commission
-                    ret_pct    = net / position["cost_basis"] * 100
-                    holding    = all_dates.index(date) - all_dates.index(position["buy_date"])
-
-                    cash += position["cost_basis"] + net
-                    trades.append({
-                        "symbol":       symbol,
-                        "buy_date":     position["buy_date"],
-                        "sell_date":    date,
-                        "buy_price":    position["buy_price"],
-                        "sell_price":   sell_price,
-                        "shares":       position["shares"],
-                        "gross_profit": round(gross, 2),
-                        "commission":   round(commission, 2),
-                        "net_profit":   round(net, 2),
-                        "return_pct":   round(ret_pct, 4),
-                        "holding_days": holding,
-                        "exit_reason":  "SELL_SIGNAL",
-                    })
-                    position = None
-
-            # -- BUY logic ----------------------------------------------------
-            if position is None and signal == "BUY":
-                invest = min(capital_per_trade, cash * 0.9)
-                if invest >= 100 and price > 0:
-                    shares    = invest / price
-                    cost      = shares * price
-                    cash     -= cost
-                    position  = {
-                        "buy_date":  date,
-                        "buy_price": price,
-                        "shares":    shares,
-                        "cost_basis": cost,
-                    }
-
-            # Track equity (cash + open position value)
-            open_val = position["shares"] * price if position else 0.0
-            equity_curve.append(cash + open_val)
-
-        # -- Close any open position at end of period -------------------------
-        if position is not None:
-            last_price = float(df.iloc[-1]["close"])
-            gross      = (last_price - position["buy_price"]) * position["shares"]
-            commission = (position["cost_basis"] * BUY_COMMISSION +
-                          last_price * position["shares"] * SELL_COMMISSION)
-            net        = gross - commission
-            ret_pct    = net / position["cost_basis"] * 100
-            holding    = (len(all_dates) - 1 -
-                          all_dates.index(position["buy_date"]))
-            cash      += position["cost_basis"] + net
-            trades.append({
-                "symbol":       symbol,
-                "buy_date":     position["buy_date"],
-                "sell_date":    df.iloc[-1]["date"],
-                "buy_price":    position["buy_price"],
-                "sell_price":   last_price,
-                "shares":       position["shares"],
-                "gross_profit": round(gross, 2),
-                "commission":   round(commission, 2),
-                "net_profit":   round(net, 2),
-                "return_pct":   round(ret_pct, 4),
-                "holding_days": holding,
-                "exit_reason":  "END_OF_PERIOD",
-            })
-
-        if not trades:
-            return None
-
-        # -- Persist trades ---------------------------------------------------
-        run_id     = str(uuid.uuid4())[:8]
-        created_at = datetime.now().isoformat()
-        for t in trades:
-            conn.execute("""
-                INSERT INTO backtest_trades
-                (run_id, symbol, buy_date, sell_date, buy_price, sell_price,
-                 shares, gross_profit, commission, net_profit, return_pct,
-                 holding_days, exit_reason, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (run_id, t["symbol"], t["buy_date"], t["sell_date"],
-                  t["buy_price"], t["sell_price"], t["shares"],
-                  t["gross_profit"], t["commission"], t["net_profit"],
-                  t["return_pct"], t["holding_days"], t["exit_reason"],
-                  created_at))
-        conn.commit()
-
-        # -- Compute metrics --------------------------------------------------
-        returns       = [t["return_pct"] for t in trades]
-        winners       = [r for r in returns if r > 0]
-        losers        = [r for r in returns if r <= 0]
-        total_return  = (cash - capital) / capital * 100
-        win_rate      = len(winners) / len(trades) * 100 if trades else 0.0
-        sharpe        = _sharpe(returns)
-        max_dd        = _max_drawdown(equity_curve)
-
-        summary = {
-            "run_id":            run_id,
-            "symbol":            symbol,
-            "start_date":        df.iloc[0]["date"],
-            "end_date":          df.iloc[-1]["date"],
-            "starting_capital":  capital,
-            "ending_capital":    round(cash, 2),
-            "total_return_pct":  round(total_return, 4),
-            "total_trades":      len(trades),
-            "winning_trades":    len(winners),
-            "losing_trades":     len(losers),
-            "win_rate_pct":      round(win_rate, 2),
-            "avg_return_pct":    round(float(np.mean(returns)), 4) if returns else 0.0,
-            "best_trade_pct":    round(max(returns), 4) if returns else 0.0,
-            "worst_trade_pct":   round(min(returns), 4) if returns else 0.0,
-            "max_drawdown_pct":  max_dd,
-            "sharpe_ratio":      sharpe,
-        }
-
-        conn.execute("""
-            INSERT OR REPLACE INTO backtest_summary
-            (run_id, symbol_filter, start_date, end_date, starting_capital,
-             ending_capital, total_return_pct, total_trades, winning_trades,
-             losing_trades, win_rate_pct, avg_return_pct, best_trade_pct,
-             worst_trade_pct, max_drawdown_pct, sharpe_ratio, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (run_id, symbol, summary["start_date"], summary["end_date"],
-              capital, summary["ending_capital"], summary["total_return_pct"],
-              len(trades), len(winners), len(losers), win_rate,
-              summary["avg_return_pct"], summary["best_trade_pct"],
-              summary["worst_trade_pct"], max_dd, sharpe, created_at))
-        conn.commit()
-
-        return summary
-
-    except Exception as e:
-        print(f"  [ERR] Backtest failed for {symbol}: {e}")
-        traceback.print_exc()
-        return None
+        df = pd.read_sql_query("""
+            SELECT date, open, high, low, close, volume,
+                   price_change_pct, volume_ratio, atr14, market_condition
+            FROM   clean_price_history
+            WHERE  symbol = ?
+            ORDER  BY date ASC
+        """, conn, params=(symbol,))
     finally:
         conn.close()
 
+    if df.empty or len(df) < 30:
+        return None
 
-# ── BACKTEST ALL SYMBOLS ──────────────────────────────────────────────────────
-def backtest_all(start_date=None, end_date=None,
-                 capital=DEFAULT_CAPITAL,
-                 capital_per_trade=CAPITAL_PER_TRADE):
-    """
-    Run backtest_symbol() for every symbol that has signal data.
-    Returns a DataFrame ranking all symbols by total_return_pct.
-    """
-    conn = get_db()
-    symbols = [r[0] for r in conn.execute(
-        "SELECT DISTINCT symbol FROM signals"
-    ).fetchall()]
-    conn.close()
+    try:
+        df_with_sig = generate_signals(df, indicator_config)
+        result = run_backtest(df, df_with_sig["signal"], backtest_config)
+        result["symbol"]    = symbol
+        result["indicator"] = indicator_config["name"]
+        result["indicator_type"] = indicator_config["type"]
+        return result
+    except Exception as e:
+        return None
 
-    total = len(symbols)
-    print(f"Backtesting {total} symbols...")
+
+# ── BACKTEST ALL INDICATORS FOR ONE SYMBOL ────────────────────────────────────
+def backtest_all_indicators(symbol: str,
+                             backtest_config: dict | None = None) -> list:
+    """
+    Run backtest_indicator() for every config in get_all_indicator_configs().
+    Returns a list of result dicts sorted by winrate descending.
+    Prints progress every 50 indicators.
+    """
+    if backtest_config is None:
+        backtest_config = DEFAULT_CONFIG.copy()
+
+    configs = get_all_indicator_configs()
     results = []
-    done, failed = 0, 0
+    failed  = 0
 
-    for i, symbol in enumerate(symbols, 1):
-        res = backtest_symbol(symbol, start_date=start_date,
-                              end_date=end_date, capital=capital,
-                              capital_per_trade=capital_per_trade)
-        if res:
+    for i, cfg in enumerate(configs, 1):
+        res = backtest_indicator(symbol, cfg, backtest_config)
+        if res and res["metrics"]["total_trades"] > 0:
             results.append(res)
-            done += 1
         else:
             failed += 1
 
-        if i % 50 == 0 or i == total:
-            print(f"  [{i}/{total}] done={done} failed={failed}")
+        if i % 50 == 0 or i == len(configs):
+            print(f"  [{i}/{len(configs)}] valid={len(results)} failed/no-trades={failed}")
 
+    results.sort(key=lambda r: r["metrics"]["winrate"], reverse=True)
+    return results
+
+
+# ── PRETTY PRINT RESULTS TABLE ────────────────────────────────────────────────
+def print_results_table(results: list, n: int = 20):
+    """Print a formatted leaderboard of indicator backtest results."""
     if not results:
-        print("  No results.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(results).sort_values("total_return_pct", ascending=False)
-    df.reset_index(drop=True, inplace=True)
-    print(f"\n[DONE] Backtested {done} symbols | {failed} skipped")
-    return df
-
-
-# ── PERFORMANCE REPORT ────────────────────────────────────────────────────────
-def print_performance_report(df, n=20):
-    """Print top/bottom performers and aggregate market statistics."""
-    if df is None or df.empty:
-        print("No backtest data to report.")
+        print("  No results to display.")
         return
 
-    cols = ["symbol", "total_trades", "win_rate_pct",
-            "avg_return_pct", "total_return_pct",
-            "max_drawdown_pct", "sharpe_ratio"]
+    header = f"{'#':>3}  {'Indicator':<24} {'Type':<12} {'Trades':>6} {'WinRate':>8} {'PF':>6} {'AvgW%':>7} {'AvgL%':>7} {'MaxDD%':>7} {'Return%':>8}"
+    print(header)
+    print("-" * len(header))
 
-    print(f"\n{'='*60}")
-    print(f"  TOP {n} PERFORMERS")
-    print(f"{'='*60}")
-    print(df[cols].head(n).to_string(index=False))
-
-    print(f"\n{'='*60}")
-    print(f"  BOTTOM {n} PERFORMERS")
-    print(f"{'='*60}")
-    print(df[cols].tail(n).to_string(index=False))
-
-    print(f"\n{'='*60}")
-    print(f"  AGGREGATE STATS  ({len(df)} symbols)")
-    print(f"{'='*60}")
-    print(f"  Avg return:      {df['total_return_pct'].mean():.2f}%")
-    print(f"  Median return:   {df['total_return_pct'].median():.2f}%")
-    print(f"  % profitable:    {(df['total_return_pct'] > 0).mean()*100:.1f}%")
-    print(f"  Avg win rate:    {df['win_rate_pct'].mean():.1f}%")
-    print(f"  Avg Sharpe:      {df['sharpe_ratio'].mean():.4f}")
-    print(f"  Avg max DD:      {df['max_drawdown_pct'].mean():.2f}%")
-    print(f"  Best symbol:     {df.iloc[0]['symbol']}  "
-          f"({df.iloc[0]['total_return_pct']:.2f}%)")
-    print(f"  Worst symbol:    {df.iloc[-1]['symbol']}  "
-          f"({df.iloc[-1]['total_return_pct']:.2f}%)")
+    for rank, res in enumerate(results[:n], 1):
+        m = res["metrics"]
+        print(
+            f"{rank:>3}  {res['indicator']:<24} {res['indicator_type']:<12} "
+            f"{m['total_trades']:>6} {m['winrate']:>7.1f}% {m['profit_factor']:>6.2f} "
+            f"{m['avg_win_pct']:>7.2f} {m['avg_loss_pct']:>7.2f} "
+            f"{m['max_drawdown']:>7.2f} {m['total_return_pct']:>8.2f}%"
+        )
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 55)
-    print("NEPSE Backtester - Step 6")
-    print("=" * 55)
-
-    # 1. Create tables
-    create_backtest_tables()
+    print("=" * 65)
+    print("NEPSE Backtester - Step 7")
+    print("=" * 65)
     print()
 
-    # 2. Test single symbol — NABIL
-    print("Testing backtest on NABIL...")
-    result = backtest_symbol("NABIL")
-    if result:
-        print("\nNABIL backtest result:")
-        for k, v in result.items():
-            if k not in ("run_id",):
-                print(f"  {k:<22} {v}")
-    else:
-        print("  Not enough signal data for NABIL.")
-    print()
+    SYMBOL = "NABIL"
+    BT_CONFIG = {
+        "stop_loss_pct":     5.0,
+        "take_profit_pct":  10.0,
+        "max_hold_days":    15,
+        "initial_capital":  100_000,
+        "position_size_pct": 10.0,
+    }
 
-    # 3. Prompt for full backtest
-    answer = input("Run full backtest on all symbols? (y/n): ").strip().lower()
-    if answer == "y":
-        all_results = backtest_all()
-        print_performance_report(all_results)
-    else:
-        print("Skipped full backtest.")
-    print()
-
-    # 4. DB summary
+    # 1. Load NABIL
     conn = get_db()
-    trade_count   = conn.execute("SELECT COUNT(*) FROM backtest_trades").fetchone()[0]
-    summary_count = conn.execute("SELECT COUNT(*) FROM backtest_summary").fetchone()[0]
+    nabil_df = pd.read_sql_query("""
+        SELECT date, open, high, low, close, volume,
+               price_change_pct, volume_ratio, atr14, market_condition
+        FROM   clean_price_history
+        WHERE  symbol = 'NABIL'
+        ORDER  BY date ASC
+    """, conn)
     conn.close()
+    print(f"NABIL: {len(nabil_df)} rows loaded")
+    print(f"Config: SL={BT_CONFIG['stop_loss_pct']}%  "
+          f"TP={BT_CONFIG['take_profit_pct']}%  "
+          f"MaxHold={BT_CONFIG['max_hold_days']}d  "
+          f"PositionSize={BT_CONFIG['position_size_pct']}%")
+    print()
 
-    print(f"backtest_trades rows:   {trade_count}")
-    print(f"backtest_summary rows:  {summary_count}")
-    print("\n[OK] Step 6 complete!")
+    # 2. Test 3 specific indicators
+    get_all_indicator_configs()   # suppress the print by capturing
+    test_cfgs = [
+        {"name": "RSI_14_30_70",  "type": "momentum",   "indicator": "rsi",      "params": {"period": 14, "oversold": 30, "overbought": 70}},
+        {"name": "MACD_12_26_9",  "type": "trend",      "indicator": "macd",     "params": {"fast": 12, "slow": 26, "signal": 9}},
+        {"name": "EMA_9_21",      "type": "trend",      "indicator": "ema_cross", "params": {"fast": 9, "slow": 21}},
+        {"name": "BB_20_2.0",     "type": "volatility", "indicator": "bollinger", "params": {"period": 20, "std": 2.0}},
+        {"name": "OBV_20",        "type": "volume",     "indicator": "obv",       "params": {"ema_period": 20}},
+    ]
+
+    spot_results = []
+    for cfg in test_cfgs:
+        df_sig = generate_signals(nabil_df.copy(), cfg)
+        res    = run_backtest(nabil_df, df_sig["signal"], BT_CONFIG)
+        res["indicator"] = cfg["name"]
+        res["indicator_type"] = cfg["type"]
+        spot_results.append(res)
+
+    print(f"{'Indicator':<24} {'Type':<12} {'Trades':>6} {'WinRate':>8} {'PF':>6} {'Return%':>9}  Trades detail")
+    print("-" * 90)
+    for res in spot_results:
+        m = res["metrics"]
+        exits = {}
+        for t in res["trades"]:
+            exits[t["exit_reason"]] = exits.get(t["exit_reason"], 0) + 1
+        detail = "  ".join(f"{k}:{v}" for k, v in exits.items())
+        print(f"  {res['indicator']:<22} {res['indicator_type']:<12} "
+              f"{m['total_trades']:>6} {m['winrate']:>7.1f}% "
+              f"{m['profit_factor']:>6.2f} {m['total_return_pct']:>8.2f}%  {detail}")
+    print()
+
+    # 3. Full run over all 163 indicators
+    answer = input("Run full backtest over all 163 indicators for NABIL? (y/n): ").strip().lower()
+    if answer == "y":
+        print()
+        print(f"Running all indicator configs on {SYMBOL}...")
+        all_results = backtest_all_indicators(SYMBOL, BT_CONFIG)
+        print()
+        print(f"Top 20 indicators by win rate:")
+        print_results_table(all_results, n=20)
+        print()
+        print(f"Bottom 10 indicators by win rate:")
+        print_results_table(list(reversed(all_results)), n=10)
+        print()
+        print(f"Total indicators with trades: {len(all_results)}")
+        if all_results:
+            best = all_results[0]
+            print(f"Best:  {best['indicator']}  winrate={best['metrics']['winrate']:.1f}%  "
+                  f"return={best['metrics']['total_return_pct']:.2f}%")
+    else:
+        print("Skipped full run.")
+
+    print()
+    print("[OK] Step 7 complete!")
