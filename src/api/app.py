@@ -38,15 +38,10 @@ if "RAILWAY_VOLUME_MOUNT_PATH" in os.environ:
 else:
     DB_PATH = os.path.join(ROOT, "data", "nepse.db")
 
+from src.data.db_factory import get_db_connection
+
 def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=60.0)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass  # WAL may fail on some filesystems, not critical
-    conn.row_factory = sqlite3.Row
-    return conn
+    return get_db_connection(DB_PATH)
 
 # -- ADMIN KEY (Change this if you want) --
 SCRAPE_KEY = "antigravity_trigger_2026"
