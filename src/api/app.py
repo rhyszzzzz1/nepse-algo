@@ -797,6 +797,106 @@ def get_backtest_job_status(symbol):
     return jsonify(job)
 
 
+# ── BROKER ACCUMULATION ───────────────────────────────────────────────────────
+@app.route("/api/broker/update", methods=["POST"])
+def broker_update():
+    """Trigger daily floor sheet fetch + broker_summary recompute (background)."""
+    def _run():
+        try:
+            sys.path.insert(0, os.path.join(ROOT, "src", "data"))
+            from floorsheet_pipeline import run_daily_update
+            run_daily_update()
+        except Exception as e:
+            import traceback
+            print(f"[broker/update] ERROR: {e}")
+            traceback.print_exc()
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "message": "Daily floor sheet update running in background"})
+
+
+@app.route("/api/broker/summary/<symbol>")
+def broker_summary_route(symbol):
+    """Broker accumulation data for a stock. ?days=30&top=10&broker=<id>"""
+    days   = int(request.args.get("days",  30))
+    top_n  = int(request.args.get("top",   10))
+    broker = request.args.get("broker")
+    sym    = symbol.upper()
+    conn   = get_db()
+    try:
+        cutoff = conn.execute(
+            "SELECT date FROM (SELECT DISTINCT date FROM broker_summary ORDER BY date DESC LIMIT ?) ORDER BY date ASC LIMIT 1",
+            (days,)
+        ).fetchone()
+        since = cutoff[0] if cutoff else "2020-01-01"
+
+        if broker:
+            history = rows_to_list(conn.execute("""
+                SELECT date, broker, buy_qty, sell_qty, net_qty,
+                       buy_amount, sell_amount, net_amount,
+                       trades_as_buyer, trades_as_seller
+                FROM broker_summary WHERE symbol=? AND broker=? AND date>=?
+                ORDER BY date DESC
+            """, (sym, int(broker), since)).fetchall())
+            return jsonify({"symbol": sym, "broker": int(broker), "history": history})
+
+        top_buyers = rows_to_list(conn.execute("""
+            SELECT broker,
+                   SUM(buy_qty)  AS total_buy_qty, SUM(sell_qty)  AS total_sell_qty,
+                   SUM(net_qty)  AS total_net_qty, SUM(net_amount) AS total_net_amount,
+                   SUM(trades_as_buyer) AS total_buys, SUM(trades_as_seller) AS total_sells
+            FROM broker_summary WHERE symbol=? AND date>=?
+            GROUP BY broker ORDER BY total_net_qty DESC LIMIT ?
+        """, (sym, since, top_n)).fetchall())
+
+        top_sellers = rows_to_list(conn.execute("""
+            SELECT broker, SUM(net_qty) AS total_net_qty, SUM(net_amount) AS total_net_amount
+            FROM broker_summary WHERE symbol=? AND date>=?
+            GROUP BY broker ORDER BY total_net_qty ASC LIMIT ?
+        """, (sym, since, top_n)).fetchall())
+
+        daily = rows_to_list(conn.execute("""
+            SELECT date, SUM(buy_qty) AS total_buy_qty, SUM(sell_qty) AS total_sell_qty,
+                   SUM(net_qty) AS net_qty, COUNT(DISTINCT broker) AS active_brokers
+            FROM broker_summary WHERE symbol=? AND date>=?
+            GROUP BY date ORDER BY date ASC
+        """, (sym, since)).fetchall())
+
+        return jsonify({"symbol": sym, "days": days, "since": since,
+                        "top_buyers": top_buyers, "top_sellers": top_sellers,
+                        "daily_flow": daily})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/broker/leaderboard")
+def broker_leaderboard():
+    """Which brokers are accumulating the most? ?days=30&top=20"""
+    days  = int(request.args.get("days", 30))
+    top_n = int(request.args.get("top",  20))
+    conn  = get_db()
+    try:
+        cutoff = conn.execute(
+            "SELECT date FROM (SELECT DISTINCT date FROM broker_summary ORDER BY date DESC LIMIT ?) ORDER BY date ASC LIMIT 1",
+            (days,)
+        ).fetchone()
+        since = cutoff[0] if cutoff else "2020-01-01"
+        rows = rows_to_list(conn.execute("""
+            SELECT broker, COUNT(DISTINCT symbol) AS stocks_accumulated,
+                   SUM(net_qty) AS total_net_qty, SUM(net_amount) AS total_net_amount,
+                   SUM(buy_qty) AS total_buy_qty, SUM(sell_qty) AS total_sell_qty
+            FROM broker_summary WHERE date>=?
+            GROUP BY broker ORDER BY total_net_qty DESC LIMIT ?
+        """, (since, top_n)).fetchall())
+        return jsonify({"since": since, "days": days, "leaderboard": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
