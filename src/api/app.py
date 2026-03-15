@@ -175,7 +175,10 @@ def get_company_dividends(symbol):
 @app.route("/api/scrape/start", methods=["POST", "GET"])
 def trigger_scrape():
     # Basic security
-    key = request.args.get("key") or request.json.get("key") if request.is_json else None
+    key = request.args.get("key")
+    if not key and request.is_json:
+        key = request.json.get("key")
+    
     if key != SCRAPE_KEY:
         return jsonify({"status": "unauthorized"}), 401
         
