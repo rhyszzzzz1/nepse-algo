@@ -71,6 +71,9 @@ def index():
             "GET  /api/price/<SYMBOL>?days=90",
             "GET  /api/stock/<SYMBOL>",
             "GET  /api/stock/<SYMBOL>/ohlcv",
+            "GET  /api/company/<SYMBOL>",
+            "GET  /api/company/<SYMBOL>/news",
+            "GET  /api/company/<SYMBOL>/dividends",
             "GET  /api/screener",
             "GET  /api/backtest",
             "GET  /api/backtest/<SYMBOL>",
@@ -110,6 +113,60 @@ def health():
     except Exception as e:
         import traceback
         return jsonify({"status": "error", "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+# ── COMPANY DETAILS (Merolagani Info) ─────────────────────────────────────────
+@app.route("/api/company/<symbol>")
+def get_company_about(symbol):
+    conn = get_db()
+    try:
+        symbol = symbol.upper()
+        # Check if table exists
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "about_company" not in tables:
+            return jsonify({"error": "about_company table not found"}), 404
+            
+        row = conn.execute("SELECT * FROM about_company WHERE symbol = ?", (symbol,)).fetchone()
+        if not row:
+            return jsonify({"error": f"No about info for '{symbol}'"}), 404
+            
+        return jsonify({"symbol": symbol, "about": dict(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route("/api/company/<symbol>/news")
+def get_company_news(symbol):
+    conn = get_db()
+    try:
+        symbol = symbol.upper()
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "news" not in tables:
+            return jsonify({"error": "news table not found"}), 404
+            
+        rows = rows_to_list(conn.execute("SELECT * FROM news WHERE symbol = ?", (symbol,)).fetchall())
+        return jsonify({"symbol": symbol, "news": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route("/api/company/<symbol>/dividends")
+def get_company_dividends(symbol):
+    conn = get_db()
+    try:
+        symbol = symbol.upper()
+        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "dividend" not in tables:
+            return jsonify({"error": "dividend table not found"}), 404
+            
+        rows = rows_to_list(conn.execute("SELECT * FROM dividend WHERE symbol = ?", (symbol,)).fetchall())
+        return jsonify({"symbol": symbol, "dividends": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 
 # ── MARKET OVERVIEW ───────────────────────────────────────────────────────────

@@ -75,6 +75,24 @@ def ensure_schema():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bs_sym_broker ON broker_summary(symbol, broker)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bs_date_sym   ON broker_summary(date, symbol)")
+
+    # ── Daily Price OHLCV ──
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_price (
+            date        TEXT NOT NULL,
+            symbol      TEXT NOT NULL,
+            open        REAL,
+            high        REAL,
+            low         REAL,
+            close       REAL,
+            volume      REAL,
+            amount      REAL,
+            trades      INTEGER,
+            vwap        REAL,
+            fetched_at  TEXT,
+            PRIMARY KEY (date, symbol)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -198,39 +216,59 @@ SESSION.headers.update({
 
 ML_URL = "https://merolagani.com/Floorsheet.aspx"
 
-def _get_ml_state():
-    """GET the global floorsheet page; return hidden form fields."""
-    time.sleep(random.uniform(1.0, 2.0))
-    r = SESSION.get(ML_URL, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+def _get_ml_state(soup=None, html=None):
+    """Extract all hidden form fields from a parsed page."""
+    if soup is None:
+        soup = BeautifulSoup(html, "html.parser")
     state = {}
-    for inp in soup.find_all("input", {"type": "hidden"}):
+    for inp in soup.find_all("input"):
         n = inp.get("name", "")
         if n:
             state[n] = inp.get("value", "")
     return state
 
-def _ml_base_payload(date_str, state):
-    """Common form fields for merolagani global floorsheet, date_str = MM/DD/YYYY."""
-    return {
-        "__VIEWSTATE":          state.get("__VIEWSTATE", ""),
-        "__VIEWSTATEGENERATOR": state.get("__VIEWSTATEGENERATOR", ""),
-        "__EVENTVALIDATION":    state.get("__EVENTVALIDATION", ""),
-        "__ASYNCPOST":          "true",
-        "ctl00$ASCompany$hdnAutoSuggest":    "0",
-        "ctl00$ASCompany$txtAutoSuggest":    "",
-        "ctl00$txtNews":                     "",
-        "ctl00$AutoSuggest1$hdnAutoSuggest": "0",
-        "ctl00$AutoSuggest1$txtAutoSuggest": "",
-        "ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter": date_str,
-        "ctl00$ContentPlaceHolder1$txtBuyerFilter":  "",
-        "ctl00$ContentPlaceHolder1$txtSellerFilter": "",
-        "ctl00$ContentPlaceHolder1$txtStockFilter":  "",
-    }
+def _ml_parse_table(soup_or_html):
+    """Parse the floor sheet table. Returns (rows_list, total_pages)."""
+    if isinstance(soup_or_html, str):
+        soup = BeautifulSoup(soup_or_html, "html.parser")
+    else:
+        soup = soup_or_html
+
+    table = None
+    for t in soup.find_all("table"):
+        headers = t.get_text().lower()
+        if "buyer" in headers and "seller" in headers:
+            table = t
+            break
+
+    rows = []
+    if table:
+        for tr in table.find_all("tr")[1:]:
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) < 6:
+                continue
+            try:
+                # Columns: # | Symbol | Buyer | Seller | Qty | Rate | Amount
+                rows.append({
+                    "symbol":        tds[1].upper(),
+                    "buyer_broker":  _int(tds[2]),
+                    "seller_broker": _int(tds[3]),
+                    "quantity":      _float(tds[4]),
+                    "rate":          _float(tds[5]),
+                    "amount":        _float(tds[6]) if len(tds) > 6 else round(_float(tds[4]) * _float(tds[5]), 2),
+                })
+            except Exception:
+                continue
+
+    total_pages = 1
+    m = re.search(r"Total pages:\s*(\d+)", soup.get_text(), re.IGNORECASE)
+    if m:
+        total_pages = int(m.group(1))
+
+    return rows, total_pages
 
 def _ml_parse_delta(raw):
-    """Extract HTML from ASP.NET UpdatePanel delta response."""
+    """Extract HTML from ASP.NET UpdatePanel delta response (for pagination only)."""
     pattern = re.compile(r'(\d+)\|updatePanel\|([^|]+)\|')
     best = ""
     pos = 0
@@ -246,45 +284,6 @@ def _ml_parse_delta(raw):
         pos = start + length
     return best or None
 
-def _ml_parse_table(html):
-    """Parse the floor sheet table from HTML. Returns list of row dicts + total_pages."""
-    soup = BeautifulSoup(html, "html.parser")
-
-    table = None
-    for t in soup.find_all("table"):
-        headers = [th.get_text(strip=True).lower() for th in t.find_all(["th", "td"])[:8]]
-        if any("buyer" in h or "seller" in h or "qty" in h for h in headers):
-            table = t
-            break
-
-    rows = []
-    if table:
-        trs = table.find_all("tr")
-        for tr in trs[1:]:
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) < 7:
-                continue
-            try:
-                # Columns: # | Symbol | Buyer | Seller | Qty | Rate | Amount
-                rows.append({
-                    "symbol":        tds[1].upper(),
-                    "buyer_broker":  _int(tds[2]),
-                    "seller_broker": _int(tds[3]),
-                    "quantity":      _float(tds[4]),
-                    "rate":          _float(tds[5]),
-                    "amount":        _float(tds[6]) if len(tds) > 6 else _float(tds[4]) * _float(tds[5]),
-                })
-            except Exception:
-                continue
-
-    # Total pages
-    total_pages = 1
-    m = re.search(r"Total pages:\s*(\d+)", soup.get_text(), re.IGNORECASE)
-    if m:
-        total_pages = int(m.group(1))
-
-    return rows, total_pages
-
 def fetch_historical_via_merolagani(date_str_ymd):
     """
     Fetch full market floor sheet for one date from merolagani.com/Floorsheet.aspx
@@ -292,60 +291,83 @@ def fetch_historical_via_merolagani(date_str_ymd):
     Returns: number of rows saved
     """
     dt = datetime.strptime(date_str_ymd, "%Y-%m-%d")
-    ml_date = dt.strftime("%m/%d/%Y")  # merolagani expects MM/DD/YYYY
+    ml_date    = dt.strftime("%m/%d/%Y")  # MM/DD/YYYY
     fetched_at = datetime.now().isoformat()
 
     try:
-        state = _get_ml_state()
+        # ── Step 1: GET the page to collect form state ────────────────────────
+        time.sleep(random.uniform(1.0, 2.0))
+        r0 = SESSION.get(ML_URL, timeout=30)
+        r0.raise_for_status()
+        soup0 = BeautifulSoup(r0.text, "html.parser")
+        state = _get_ml_state(soup0)
 
-        # Search POST — page 0
-        payload = _ml_base_payload(ml_date, state)
-        payload.update({
-            "ctl00$ScriptManager1": "ctl00$ContentPlaceHolder1$updFloorsheet|ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet",
-            "__EVENTTARGET":   "ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet",
-            "__EVENTARGUMENT": "",
-            "ctl00$ContentPlaceHolder1$PagerControl1$hdnPCID":        "PC1",
-            "ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage": "0",
-        })
+        # ── Step 2: Regular full-page POST to search for date ─────────────────
+        payload = dict(state)
+        payload["__EVENTTARGET"]   = "ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet"
+        payload["__EVENTARGUMENT"] = ""
+        payload["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"]     = ml_date
+        payload["ctl00$ContentPlaceHolder1$txtBuyerBrokerCodeFilter"]    = ""
+        payload["ctl00$ContentPlaceHolder1$txtSellerBrokerCodeFilter"]   = ""
+        payload["ctl00$ContentPlaceHolder1$ASCompanyFilter$hdnAutoSuggest"] = "0"
+        payload["ctl00$ContentPlaceHolder1$ASCompanyFilter$txtAutoSuggest"]  = ""
+        payload["ctl00$ContentPlaceHolder1$PagerControl1$hdnPCID"]        = "PC1"
+        payload["ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage"] = "0"
+        payload["ctl00$ContentPlaceHolder1$PagerControl2$hdnPCID"]        = "PC2"
+        payload["ctl00$ContentPlaceHolder1$PagerControl2$hdnCurrentPage"] = "0"
 
-        time.sleep(random.uniform(0.8, 1.5))
-        r = SESSION.post(ML_URL, data=payload, headers={
-            "X-MicrosoftAjax":  "Delta=true",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer":          ML_URL,
+        time.sleep(random.uniform(1.0, 2.0))
+        r1 = SESSION.post(ML_URL, data=payload, headers={
+            "Content-Type":            "application/x-www-form-urlencoded",
+            "Referer":                 ML_URL,
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest":          "document",
+            "Sec-Fetch-Mode":          "navigate",
+            "Sec-Fetch-Site":          "same-origin",
         }, timeout=30)
-        r.raise_for_status()
+        r1.raise_for_status()
 
-        html = _ml_parse_delta(r.text)
-        if not html:
-            print(f"  [{date_str_ymd}] No delta HTML")
+        soup1 = BeautifulSoup(r1.text, "html.parser")
+
+        # Check for "no data" message
+        page_text = soup1.get_text()
+        if "Could not find floorsheet" in page_text or "No record" in page_text:
+            print(f"  [{date_str_ymd}] No data (holiday or data not available)")
             return 0
 
-        page_rows, total_pages = _ml_parse_table(html)
+        page_rows, total_pages = _ml_parse_table(soup1)
+
+        if not page_rows:
+            print(f"  [{date_str_ymd}] No table rows found in response")
+            return 0
+
         all_rows = list(page_rows)
+        first_row = page_rows[0].copy()
 
-        if not page_rows and total_pages == 1:
-            print(f"  [{date_str_ymd}] No data (holiday or too old)")
-            return 0
+        # Update state from the result page for pagination
+        state = _get_ml_state(soup1)
 
-        # Update state from delta
-        vs = re.search(r'\|hiddenField\|__VIEWSTATE\|([^|]+)', r.text)
-        ev = re.search(r'\|hiddenField\|__EVENTVALIDATION\|([^|]+)', r.text)
-        if vs: state["__VIEWSTATE"] = vs.group(1)
-        if ev: state["__EVENTVALIDATION"] = ev.group(1)
-
-        # Pages 1+
+        # ── Step 3: Paginate using AJAX for pages 2+ ──────────────────────────
         for page in range(1, total_pages):
-            payload2 = _ml_base_payload(ml_date, state)
-            payload2.update({
-                "ctl00$ScriptManager1": "ctl00$ContentPlaceHolder1$updFloorsheet|ctl00$ContentPlaceHolder1$PagerControl1$btnPaging",
-                "__EVENTTARGET":   "",
-                "__EVENTARGUMENT": "",
-                "ctl00$ContentPlaceHolder1$PagerControl1$hdnPCID":        "PC1",
-                "ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage": str(page),
-                "ctl00$ContentPlaceHolder1$PagerControl1$btnPaging":      "",
-            })
+            payload2 = dict(state)
+            payload2["ctl00$ScriptManager1"] = (
+                "ctl00$ContentPlaceHolder1$updFloorsheet"
+                "|ctl00$ContentPlaceHolder1$PagerControl1$btnPaging"
+            )
+            payload2["__EVENTTARGET"]   = ""
+            payload2["__EVENTARGUMENT"] = ""
+            payload2["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"]     = ml_date
+            payload2["ctl00$ContentPlaceHolder1$txtBuyerBrokerCodeFilter"]    = ""
+            payload2["ctl00$ContentPlaceHolder1$txtSellerBrokerCodeFilter"]   = ""
+            payload2["ctl00$ContentPlaceHolder1$ASCompanyFilter$hdnAutoSuggest"] = "0"
+            payload2["ctl00$ContentPlaceHolder1$ASCompanyFilter$txtAutoSuggest"]  = ""
+            payload2["ctl00$ContentPlaceHolder1$PagerControl1$hdnPCID"]        = "PC1"
+            payload2["ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage"] = str(page)
+            payload2["ctl00$ContentPlaceHolder1$PagerControl1$btnPaging"]      = ""
+            payload2["ctl00$ContentPlaceHolder1$PagerControl2$hdnPCID"]        = "PC2"
+            payload2["ctl00$ContentPlaceHolder1$PagerControl2$hdnCurrentPage"] = "0"
+            payload2["__ASYNCPOST"] = "true"
+
             time.sleep(random.uniform(0.5, 1.0))
             r2 = SESSION.post(ML_URL, data=payload2, headers={
                 "X-MicrosoftAjax":  "Delta=true",
@@ -357,35 +379,112 @@ def fetch_historical_via_merolagani(date_str_ymd):
 
             html2 = _ml_parse_delta(r2.text)
             if not html2:
-                break
-            rows2, _ = _ml_parse_table(html2)
-            if not rows2:
+                # Fall back to full-page POST for this page
+                p3 = dict(state)
+                p3["__EVENTTARGET"]   = "ctl00$ContentPlaceHolder1$PagerControl1$btnPaging"
+                p3["__EVENTARGUMENT"] = str(page)
+                p3["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"] = ml_date
+                p3["ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage"] = str(page)
+                time.sleep(random.uniform(0.8, 1.5))
+                r3 = SESSION.post(ML_URL, data=p3, headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": ML_URL,
+                }, timeout=30)
+                soup3 = BeautifulSoup(r3.text, "html.parser")
+                rows3, _ = _ml_parse_table(soup3)
+                state = _get_ml_state(soup3)
+            else:
+                rows3, _ = _ml_parse_table(html2)
+                vs = re.search(r'\|hiddenField\|__VIEWSTATE\|([^|]+)', r2.text)
+                ev = re.search(r'\|hiddenField\|__EVENTVALIDATION\|([^|]+)', r2.text)
+                if vs: state["__VIEWSTATE"] = vs.group(1)
+                if ev: state["__EVENTVALIDATION"] = ev.group(1)
+
+            if not rows3:
                 break
             # Duplicate check
-            if rows2[0]["quantity"] == page_rows[0]["quantity"] and \
-               rows2[0]["rate"] == page_rows[0]["rate"]:
+            if rows3[0]["quantity"] == first_row["quantity"] and rows3[0]["rate"] == first_row["rate"]:
                 break
-            all_rows.extend(rows2)
+            all_rows.extend(rows3)
 
-            vs2 = re.search(r'\|hiddenField\|__VIEWSTATE\|([^|]+)', r2.text)
-            ev2 = re.search(r'\|hiddenField\|__EVENTVALIDATION\|([^|]+)', r2.text)
-            if vs2: state["__VIEWSTATE"] = vs2.group(1)
-            if ev2: state["__EVENTVALIDATION"] = ev2.group(1)
-
-        # Build DB tuples
+        # ── Save ──────────────────────────────────────────────────────────────
         db_rows = [
             (date_str_ymd, row["symbol"], row["buyer_broker"], row["seller_broker"],
              row["quantity"], row["rate"], row["amount"], fetched_at)
-            for row in all_rows if row["symbol"]
+            for row in all_rows if row.get("symbol")
         ]
-
         saved = _save_rows(db_rows)
-        print(f"  [{date_str_ymd}] {total_pages} pages, {len(all_rows)} trades, {saved} saved")
+        print(f"  [{date_str_ymd}] {total_pages}p | {len(all_rows)} trades | {saved} saved")
         return saved
 
     except Exception as e:
         print(f"  [{date_str_ymd}] ERROR: {e}")
+        traceback.print_exc()
         return 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OHLC V COMPUTATION
+# ════════════════════════════════════════════════════════════════════════════
+def compute_daily_price(dates=None):
+    """
+    Compute Open, High, Low, Close, Volume, VWAP from floor_sheet for new dates.
+    Only processes dates not already in daily_price.
+    Note: Open/Close are naive (first/last trade in the db insertion order).
+    """
+    conn = get_db()
+    if dates is None:
+        all_dates  = {r[0] for r in conn.execute("SELECT DISTINCT date FROM floor_sheet").fetchall()}
+        done_dates = {r[0] for r in conn.execute("SELECT DISTINCT date FROM daily_price").fetchall()}
+        dates = sorted(all_dates - done_dates)
+    conn.close()
+
+    if not dates:
+        print("[Price] No new dates to process.")
+        return 0
+
+    print(f"[Price] Computing OHLCV for {len(dates)} dates...")
+    fetched_at = datetime.now().isoformat()
+    total = 0
+
+    for d in dates:
+        conn = get_db()
+        try:
+            # Delete any partial rows for this date first
+            conn.execute("DELETE FROM daily_price WHERE date=?", (d,))
+
+            # Use sqlite window functions/group_concat to get open/close safely
+            conn.execute("""
+                INSERT INTO daily_price (
+                    date, symbol, open, high, low, close, volume, amount, trades, vwap, fetched_at
+                )
+                SELECT
+                    date,
+                    symbol,
+                    (SELECT rate FROM floor_sheet f2 WHERE f2.date=f1.date AND f2.symbol=f1.symbol ORDER BY id ASC LIMIT 1) as open,
+                    MAX(rate) as high,
+                    MIN(rate) as low,
+                    (SELECT rate FROM floor_sheet f3 WHERE f3.date=f1.date AND f3.symbol=f1.symbol ORDER BY id DESC LIMIT 1) as close,
+                    SUM(quantity) as volume,
+                    SUM(amount) as amount,
+                    COUNT(*) as trades,
+                    ROUND(SUM(amount) / NULLIF(SUM(quantity), 0), 2) as vwap,
+                    ?
+                FROM floor_sheet f1
+                WHERE date=?
+                GROUP BY date, symbol
+            """, (fetched_at, d))
+
+            conn.commit()
+            n = conn.execute("SELECT COUNT(*) FROM daily_price WHERE date=?", (d,)).fetchone()[0]
+            total += n
+        except Exception as e:
+            print(f"  [{d}] daily_price error: {e}")
+        finally:
+            conn.close()
+
+    print(f"[Price] Done. {total:,} rows in daily_price for {len(dates)} new dates")
+    return total
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -498,6 +597,7 @@ def run_daily_update():
             return
 
     compute_broker_summary()
+    compute_daily_price()
     print(f"[Daily] Update complete for {today}")
 
 
@@ -539,9 +639,10 @@ def run_historical_backfill(days_back=None, start_date=None):
         total += saved
         batch += 1
 
-        # Compute broker_summary in batches of 20 to keep memory low
+        # Compute summaries in batches to keep memory low
         if batch >= 20:
             compute_broker_summary()
+            compute_daily_price()
             batch = 0
 
         # Random pause every 50 requests to avoid rate limiting
@@ -550,9 +651,11 @@ def run_historical_backfill(days_back=None, start_date=None):
             print(f"[Backfill] Pausing {pause:.0f}s to avoid rate limit...")
             time.sleep(pause)
 
-    # Final broker_summary update
+    # Final updates
     compute_broker_summary()
+    compute_daily_price()
     print(f"\n[Backfill] Complete! Total floor sheet rows saved: {total:,}")
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -574,7 +677,9 @@ if __name__ == "__main__":
         run_daily_update()
     elif args.summary:
         compute_broker_summary()
+        compute_daily_price()
     elif args.days:
+
         run_historical_backfill(days_back=args.days)
     elif args.start:
         run_historical_backfill(start_date=args.start)
@@ -590,6 +695,9 @@ if __name__ == "__main__":
     fs_d = conn.execute("SELECT COUNT(DISTINCT date) FROM floor_sheet").fetchone()[0]
     bs  = conn.execute("SELECT COUNT(*) FROM broker_summary").fetchone()[0]
     bs_d = conn.execute("SELECT COUNT(DISTINCT date) FROM broker_summary").fetchone()[0]
+    dp  = conn.execute("SELECT COUNT(*) FROM daily_price").fetchone()[0]
+    dp_d = conn.execute("SELECT COUNT(DISTINCT date) FROM daily_price").fetchone()[0]
     conn.close()
     print(f"\nfloor_sheet   : {fs:>12,} rows | {fs_d} dates")
     print(f"broker_summary: {bs:>12,} rows | {bs_d} dates")
+    print(f"daily_price   : {dp:>12,} rows | {dp_d} dates")

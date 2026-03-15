@@ -1,32 +1,75 @@
 # src/data/fetcher.py
-# Step 2: NEPSE Data Fetcher
-# Fetches price, volume, floor sheet and market data from nepalstock.com
-# and stores everything in a local SQLite database.
-import sqlite3
+# NEPSE Data Fetcher — Merolagani scraper edition
+# Replaces NepseUnofficialApi with direct scraping of merolagani.com
+# Covers: company list, full price history (10+ years), floor sheet, market summary
+# Compatible with: Python 3.11, SQLite only, same function signatures as before
+
 import os
+import sys
+import sqlite3
+import time
+import random
+import re
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 
 # Force SQLite — ignore any PostgreSQL environment variables
 os.environ.pop("DATABASE_URL", None)
 os.environ.pop("POSTGRES_URL", None)
-from nepse import Nepse
-import pandas as pd
-import sqlite3
-from db import get_db
-import os
-from datetime import datetime
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-DB_PATH = "data/nepse.db"
+# ── DB SETUP (inline — do NOT import from db.py per project rules) ─────────────
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DB_PATH = os.path.join(ROOT, "data", "nepse.db")
 
-# ── SETUP ─────────────────────────────────────────────────────────────────────
-def get_nepse():
-    """Initialize and return Nepse client."""
-    nepse = Nepse()
-    nepse.setTLSVerification(False)
-    return nepse
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+# ── HTTP SESSION ───────────────────────────────────────────────────────────────
+# Merolagani is tolerant of scrapers but we add realistic headers + small delays
+# to be polite and avoid getting throttled during bulk fetches.
 
-# ── CREATE TABLES ─────────────────────────────────────────────────────────────
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer":         "https://merolagani.com/",
+})
+
+BASE_URL   = "https://merolagani.com"
+COMPANY_LIST_URL = f"{BASE_URL}/CompanyList.aspx"
+
+# Delay between requests (seconds) — randomised to be polite
+MIN_DELAY = 0.4
+MAX_DELAY = 1.0
+
+def _get(url, params=None, retries=3):
+    """GET with retry + polite delay."""
+    for attempt in range(retries):
+        try:
+            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+            resp = SESSION.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"   Retry {attempt+1}/{retries} after {wait}s — {e}")
+            time.sleep(wait)
+
+# ── CREATE TABLES ──────────────────────────────────────────────────────────────
 def create_tables():
     """Create all database tables if they don't exist."""
     conn = get_db()
@@ -49,7 +92,7 @@ def create_tables():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS companies (
-            id          INTEGER PRIMARY KEY,
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol      TEXT NOT NULL,
             name        TEXT,
             sector      TEXT,
@@ -88,74 +131,138 @@ def create_tables():
     conn.close()
     print("✅ Tables created successfully")
 
-# ── FETCH COMPANY LIST ────────────────────────────────────────────────────────
+
+# ── COMPANY LIST ───────────────────────────────────────────────────────────────
+# Merolagani lists all companies at:
+#   https://merolagani.com/CompanyList.aspx
+# The table has columns: SN, Symbol, Company Name, Sector
+# All rows are in <table class="table">
+
 def fetch_company_list():
-    """Fetch all listed companies and save to database."""
-    print("Fetching company list...")
-    nepse = get_nepse()
-    conn = get_db()
+    """
+    Fetch all listed companies from Merolagani and save to database.
+    Returns a DataFrame with columns: symbol, name, sector.
+    """
+    print("Fetching company list from Merolagani...")
+    rows = []
 
     try:
-        companies = nepse.getCompanyList()
-        df = pd.DataFrame(companies)
+        resp = _get(COMPANY_LIST_URL)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Find the main company table — it's the first <table class="table">
+        table = soup.find("table", class_="table")
+        if not table:
+            print("❌ Could not find company table on Merolagani")
+            return None
+
+        for tr in table.find("tbody").find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 4:
+                continue
+            # Columns: SN | Symbol | Company Name | Sector
+            symbol = tds[1].get_text(strip=True)
+            name   = tds[2].get_text(strip=True)
+            sector = tds[3].get_text(strip=True)
+
+            if symbol:
+                rows.append({"symbol": symbol, "name": name, "sector": sector})
+
+        df = pd.DataFrame(rows)
         print(f"   Found {len(df)} companies")
-        print(f"   Columns: {list(df.columns)}")
 
         fetched_at = datetime.now().isoformat()
+        conn = get_db()
 
         for _, row in df.iterrows():
             try:
                 conn.execute("""
                     INSERT OR REPLACE INTO companies (symbol, name, sector, fetched_at)
                     VALUES (?, ?, ?, ?)
-                """, (
-                    str(row.get('symbol', row.get('stockSymbol', ''))),
-                    str(row.get('companyName', row.get('name', ''))),
-                    str(row.get('sectorName', '')),
-                    fetched_at
-                ))
+                """, (row["symbol"], row["name"], row["sector"], fetched_at))
             except Exception as e:
-                print(f"   Skipped row: {e}")
+                print(f"   Skipped {row['symbol']}: {e}")
 
         conn.commit()
+        conn.close()
         print(f"✅ Saved {len(df)} companies to database")
         return df
 
     except Exception as e:
-        print(f"❌ Error fetching companies: {e}")
+        print(f"❌ Error fetching company list: {e}")
+        import traceback; traceback.print_exc()
         return None
-    finally:
-        conn.close()
 
-# ── FETCH PRICE HISTORY ───────────────────────────────────────────────────────
-def fetch_price_history(symbol):
-    """Fetch full price/volume history for a stock symbol."""
+
+# ── PRICE HISTORY ──────────────────────────────────────────────────────────────
+# Merolagani price history endpoint (JSON, used by their own charts):
+#   GET https://merolagani.com/handlers/TechnicalChartHandler.ashx
+#       ?type=company&q=NABIL&resolution=D&from=<unix>&to=<unix>
+#
+# Response JSON keys: t (timestamp), o, h, l, c, v (OHLCV)
+# This gives full daily OHLCV going back 10+ years for most stocks.
+# No login or token required.
+
+CHART_HANDLER = f"{BASE_URL}/handlers/TechnicalChartHandler.ashx"
+
+def _unix(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+def fetch_price_history(symbol, years_back=15):
+    """
+    Fetch full OHLCV price history for a stock symbol from Merolagani.
+    Saves to price_history table.
+    Returns a DataFrame.
+    """
     print(f"Fetching price history for {symbol}...")
-    nepse = get_nepse()
-    conn = get_db()
+
+    now  = datetime.now()
+    from_ts = _unix(now - timedelta(days=365 * years_back))
+    to_ts   = _unix(now)
+
+    params = {
+        "type":       "company",
+        "q":          symbol,
+        "resolution": "D",       # Daily bars
+        "from":       from_ts,
+        "to":         to_ts,
+    }
 
     try:
-        data = nepse.getCompanyPriceVolumeHistory(symbol)
+        resp = _get(CHART_HANDLER, params=params)
+        data = resp.json()
 
-        # Handle different return formats
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            for key, val in data.items():
-                if isinstance(val, list) and len(val) > 0:
-                    df = pd.DataFrame(val)
-                    break
-            else:
-                print(f"   Unexpected dict format: {list(data.keys())}")
-                return None
-        else:
-            print(f"   Unexpected data type: {type(data)}")
+        # Handler returns {"s": "ok", "t": [...], "o": [...], "h": [...], "l": [...], "c": [...], "v": [...]}
+        # or {"s": "no_data"} if symbol not found
+        if data.get("s") != "ok":
+            print(f"   No data for {symbol} (status: {data.get('s')})")
             return None
 
-        print(f"   Got {len(df)} rows")
-        print(f"   Columns: {list(df.columns)}")
+        timestamps = data.get("t", [])
+        opens      = data.get("o", [])
+        highs      = data.get("h", [])
+        lows       = data.get("l", [])
+        closes     = data.get("c", [])
+        volumes    = data.get("v", [])
+
+        if not timestamps:
+            print(f"   Empty response for {symbol}")
+            return None
+
+        # Build DataFrame
+        df = pd.DataFrame({
+            "date":   [datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") for ts in timestamps],
+            "open":   [float(v or 0) for v in opens],
+            "high":   [float(v or 0) for v in highs],
+            "low":    [float(v or 0) for v in lows],
+            "close":  [float(v or 0) for v in closes],
+            "volume": [float(v or 0) for v in volumes],
+        })
+
+        print(f"   Got {len(df)} rows ({df['date'].min()} → {df['date'].max()})")
 
         fetched_at = datetime.now().isoformat()
+        conn = get_db()
         saved = 0
 
         for _, row in df.iterrows():
@@ -166,97 +273,117 @@ def fetch_price_history(symbol):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     symbol,
-                    str(row.get('date', row.get('businessDate', ''))),
-                    float(row.get('openPrice',  row.get('open',  0)) or 0),
-                    float(row.get('highPrice',  row.get('high',  0)) or 0),
-                    float(row.get('lowPrice',   row.get('low',   0)) or 0),
-                    float(row.get('closePrice', row.get('close', 0)) or 0),
-                    float(row.get('totalTradedQuantity', row.get('volume', 0)) or 0),
-                    fetched_at
+                    row["date"],
+                    row["open"],
+                    row["high"],
+                    row["low"],
+                    row["close"],
+                    row["volume"],
+                    fetched_at,
                 ))
                 saved += 1
             except Exception as e:
                 print(f"   Skipped row: {e}")
 
         conn.commit()
+        conn.close()
         print(f"✅ Saved {saved} rows for {symbol}")
         return df
 
     except Exception as e:
         print(f"❌ Error fetching {symbol}: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return None
-    finally:
-        conn.close()
 
-# ── FETCH PRICE HISTORY FOR ALL COMPANIES ────────────────────────────────────
-# ── FETCH PRICE HISTORY FOR ALL COMPANIES (PARALLEL) ─────────────────────────
-def fetch_all_price_histories(max_workers=10):
-    """Fetch price history for every company using parallel threads."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ── BULK PRICE HISTORY (PARALLEL) ─────────────────────────────────────────────
+def fetch_all_price_histories(max_workers=3):
+    """
+    Fetch price history for every company in the DB using parallel threads.
+    max_workers=3 to avoid hammering Merolagani and to stay within Railway RAM.
+    """
     conn = get_db()
     symbols = [row[0] for row in conn.execute("SELECT symbol FROM companies").fetchall()]
     conn.close()
 
     total = len(symbols)
-    print(f"Fetching price history for {total} companies using {max_workers} parallel workers...")
+    print(f"Fetching price history for {total} companies with {max_workers} workers...")
 
-    success, failed = 0, 0
-    completed = 0
+    success, failed, completed = 0, 0, 0
 
     def process_one(symbol):
         try:
             result = fetch_price_history(symbol)
             return symbol, result is not None
-        except:
+        except Exception:
             return symbol, False
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_one, symbol): symbol for symbol in symbols}
+        futures = {executor.submit(process_one, sym): sym for sym in symbols}
         for future in as_completed(futures):
-            symbol, ok = future.result()
+            sym, ok = future.result()
             completed += 1
             if ok:
                 success += 1
             else:
                 failed += 1
             if completed % 20 == 0:
-                print(f"Progress: {completed}/{total} | Success: {success} | Failed: {failed}")
+                print(f"Progress: {completed}/{total} | ✅ {success} | ❌ {failed}")
 
     print(f"\n✅ Done. Success: {success} | Failed: {failed}")
-# ── FETCH FLOOR SHEET ─────────────────────────────────────────────────────────
+
+
+# ── FLOOR SHEET ────────────────────────────────────────────────────────────────
+# Merolagani exposes today's floor sheet per stock at:
+#   GET https://merolagani.com/handlers/NewFloorSheetHandler.ashx
+#       ?type=floorsheet&symbol=NABIL&page=1
+#
+# Returns JSON:
+#   { "floorsheets": { "content": [ {...}, ... ], "totalPages": N } }
+# Each item has: contractNo, stockSymbol, buyerBrokerNo, sellerBrokerNo,
+#                contractQuantity, contractRate, contractAmount, businessDate
+
+FLOORSHEET_HANDLER = f"{BASE_URL}/handlers/NewFloorSheetHandler.ashx"
+
 def fetch_floor_sheet_for(symbol):
-    """Fetch today's floor sheet (broker trades) for a symbol."""
+    """
+    Fetch today's floor sheet (broker trades) for a symbol from Merolagani.
+    Paginates through all pages automatically.
+    Saves to floor_sheet table. Returns a DataFrame.
+    """
     print(f"Fetching floor sheet for {symbol}...")
-    nepse = get_nepse()
-    conn = get_db()
+    all_rows = []
+    page = 1
 
     try:
-        data = nepse.getFloorSheetOf(symbol)
+        while True:
+            params = {"type": "floorsheet", "symbol": symbol, "page": page}
+            resp = _get(FLOORSHEET_HANDLER, params=params)
+            data = resp.json()
 
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            for key, val in data.items():
-                if isinstance(val, list):
-                    df = pd.DataFrame(val)
-                    break
-            else:
-                df = pd.DataFrame()
-        else:
-            df = pd.DataFrame()
+            content = (
+                data.get("floorsheets", {})
+                    .get("content", [])
+            )
+            if not content:
+                break
 
-        print(f"   Got {len(df)} trades")
+            all_rows.extend(content)
+            total_pages = data.get("floorsheets", {}).get("totalPages", 1)
+            if page >= total_pages:
+                break
+            page += 1
 
-        if len(df) == 0:
-            print("   No trades today (market may be closed)")
-            return df
+        if not all_rows:
+            print(f"   No floor sheet trades for {symbol} today")
+            return pd.DataFrame()
 
-        print(f"   Columns: {list(df.columns)}")
+        df = pd.DataFrame(all_rows)
+        print(f"   Got {len(df)} trades across {page} page(s)")
+
         fetched_at = datetime.now().isoformat()
-        today = datetime.now().strftime("%Y-%m-%d")
+        today      = datetime.now().strftime("%Y-%m-%d")
+        conn = get_db()
 
         for _, row in df.iterrows():
             try:
@@ -267,100 +394,147 @@ def fetch_floor_sheet_for(symbol):
                 """, (
                     today,
                     symbol,
-                    int(row.get('buyerBrokerNo',  row.get('buyMemberId',  0)) or 0),
-                    int(row.get('sellerBrokerNo', row.get('sellMemberId', 0)) or 0),
-                    float(row.get('contractQuantity', row.get('quantity', 0)) or 0),
-                    float(row.get('contractRate',     row.get('rate',     0)) or 0),
-                    float(row.get('contractAmount',   row.get('amount',   0)) or 0),
-                    fetched_at
+                    int(row.get("buyerBrokerNo",  0) or 0),
+                    int(row.get("sellerBrokerNo", 0) or 0),
+                    float(row.get("contractQuantity", 0) or 0),
+                    float(row.get("contractRate",     0) or 0),
+                    float(row.get("contractAmount",   0) or 0),
+                    fetched_at,
                 ))
             except Exception as e:
                 print(f"   Skipped row: {e}")
 
         conn.commit()
+        conn.close()
         print(f"✅ Saved floor sheet for {symbol}")
         return df
 
     except Exception as e:
-        print(f"❌ Error fetching floor sheet: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error fetching floor sheet for {symbol}: {e}")
+        import traceback; traceback.print_exc()
         return None
-    finally:
-        conn.close()
 
-# ── FETCH MARKET SUMMARY ──────────────────────────────────────────────────────
+
+# ── MARKET SUMMARY ─────────────────────────────────────────────────────────────
+# Merolagani market summary page: https://merolagani.com/MarketSummary.aspx
+# The NEPSE index value lives in a <span> or table cell labelled "NEPSE Index"
+# We also try the live market handler used by their ticker:
+#   GET https://merolagani.com/handlers/TechnicalChartHandler.ashx
+#       ?type=index&q=NEPSE&resolution=D&from=<unix>&to=<unix>
+
+MARKET_SUMMARY_URL = f"{BASE_URL}/MarketSummary.aspx"
+
 def fetch_market_summary():
-    """Fetch today's overall market summary."""
+    """
+    Fetch today's NEPSE market summary (index, turnover, volume).
+    Tries the chart handler first (clean JSON), falls back to HTML scraping.
+    Saves to market_summary table. Returns the summary dict.
+    """
     print("Fetching market summary...")
-    nepse = get_nepse()
+    fetched_at = datetime.now().isoformat()
+    today      = datetime.now().strftime("%Y-%m-%d")
     conn = get_db()
 
     try:
-        summary = nepse.getSummary()
-        fetched_at = datetime.now().isoformat()
-        today = datetime.now().strftime("%Y-%m-%d")
+        # ── Method 1: JSON chart handler for NEPSE index ───────────────────────
+        now = datetime.now()
+        params = {
+            "type":       "index",
+            "q":          "NEPSE",
+            "resolution": "D",
+            "from":       _unix(now - timedelta(days=5)),
+            "to":         _unix(now),
+        }
+        resp = _get(CHART_HANDLER, params=params)
+        data = resp.json()
 
-        if isinstance(summary, list) and len(summary) > 0:
-            print(f"   Got {len(summary)} summary items")
-            print(f"   First item keys: {list(summary[0].keys()) if isinstance(summary[0], dict) else summary[0]}")
+        nepse_index    = 0.0
+        total_turnover = 0.0
+        total_volume   = 0.0
 
-            # Find NEPSE main index entry
-            nepse_data = None
-            for item in summary:
-                if isinstance(item, dict):
-                    name = str(item.get('index', item.get('name', ''))).upper()
-                    if 'NEPSE' in name:
-                        nepse_data = item
-                        break
+        if data.get("s") == "ok" and data.get("c"):
+            nepse_index = float(data["c"][-1])    # latest close
+            total_volume = float(data.get("v", [0])[-1] or 0)
+            print(f"   NEPSE Index (from chart handler): {nepse_index}")
 
-            if not nepse_data:
-                nepse_data = summary[0]
+        # ── Method 2: HTML scrape for turnover ────────────────────────────────
+        # Only fetch if we still have 0 turnover (chart handler doesn't give turnover)
+        try:
+            page_resp = _get(MARKET_SUMMARY_URL)
+            soup = BeautifulSoup(page_resp.text, "html.parser")
 
-            conn.execute("""
-                INSERT OR REPLACE INTO market_summary
-                (date, nepse_index, total_turnover, total_volume, fetched_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                today,
-                float(nepse_data.get('currentValue', nepse_data.get('close', 0)) or 0),
-                0.0,
-                0.0,
-                fetched_at
-            ))
-            conn.commit()
-            print("✅ Market summary saved")
+            # Look for "Total Turnover" label in any table/span
+            text = soup.get_text(" ", strip=True)
+            # Pattern: "Total Turnover: 1,234,567,890"
+            m = re.search(r"Total Turnover[:\s]+([\d,]+)", text, re.IGNORECASE)
+            if m:
+                total_turnover = float(m.group(1).replace(",", ""))
+                print(f"   Total Turnover: {total_turnover}")
 
-        elif isinstance(summary, dict):
-            conn.execute("""
-                INSERT OR REPLACE INTO market_summary
-                (date, nepse_index, total_turnover, total_volume, fetched_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                today,
-                float(summary.get('nepseIndex', summary.get('currentValue', 0)) or 0),
-                float(summary.get('totalTurnover', 0) or 0),
-                float(summary.get('totalTradedShares', 0) or 0),
-                fetched_at
-            ))
-            conn.commit()
-            print("✅ Market summary saved")
+            # If index was 0 from method 1, try scraping it
+            if nepse_index == 0:
+                m2 = re.search(r"NEPSE Index[:\s]+([\d,]+\.?\d*)", text, re.IGNORECASE)
+                if m2:
+                    nepse_index = float(m2.group(1).replace(",", ""))
+                    print(f"   NEPSE Index (from HTML): {nepse_index}")
 
-        return summary
+        except Exception as html_err:
+            print(f"   HTML fallback failed (non-critical): {html_err}")
+
+        conn.execute("""
+            INSERT OR REPLACE INTO market_summary
+            (date, nepse_index, total_turnover, total_volume, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (today, nepse_index, total_turnover, total_volume, fetched_at))
+        conn.commit()
+        print("✅ Market summary saved")
+
+        return {
+            "date":           today,
+            "nepse_index":    nepse_index,
+            "total_turnover": total_turnover,
+            "total_volume":   total_volume,
+        }
 
     except Exception as e:
         print(f"❌ Error fetching market summary: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return None
     finally:
         conn.close()
 
-# ── MAIN TEST RUN ─────────────────────────────────────────────────────────────
+
+# ── INCREMENTAL UPDATE ─────────────────────────────────────────────────────────
+def fetch_price_history_incremental(symbol):
+    """
+    Only fetch data newer than what we already have in the DB.
+    Use this for daily updates after the initial full load.
+    """
+    conn = get_db()
+    row = conn.execute(
+        "SELECT MAX(date) FROM price_history WHERE symbol = ?", (symbol,)
+    ).fetchone()
+    conn.close()
+
+    last_date = row[0] if row and row[0] else None
+
+    if last_date:
+        # Fetch from the day after our last record
+        from_dt = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
+        years_back = max(1, (datetime.now() - from_dt).days / 365)
+        print(f"   Incremental: fetching {symbol} from {from_dt.date()} (last known: {last_date})")
+    else:
+        years_back = 15  # Full history for new symbols
+        print(f"   Full fetch for new symbol: {symbol}")
+
+    return fetch_price_history(symbol, years_back=years_back)
+
+
+# ── MAIN TEST RUN ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 50)
-    print("NEPSE Data Fetcher — Step 2")
-    print("=" * 50)
+    print("=" * 55)
+    print("NEPSE Data Fetcher — Merolagani Scraper Edition")
+    print("=" * 55)
 
     # 1. Create tables
     create_tables()
@@ -368,8 +542,9 @@ if __name__ == "__main__":
     # 2. Fetch company list
     companies = fetch_company_list()
 
-    # 3. Test price history with one stock
-    fetch_price_history("NABIL")
+    # 3. Test price history with a couple of stocks
+    for sym in ["NABIL", "NICA", "SCB"]:
+        fetch_price_history(sym)
 
     # 4. Fetch market summary
     fetch_market_summary()
@@ -380,6 +555,14 @@ if __name__ == "__main__":
     print(f"   Companies:     {conn.execute('SELECT COUNT(*) FROM companies').fetchone()[0]}")
     print(f"   Price rows:    {conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0]}")
     print(f"   Floor trades:  {conn.execute('SELECT COUNT(*) FROM floor_sheet').fetchone()[0]}")
+
+    # Show date range per tested symbol
+    for sym in ["NABIL", "NICA", "SCB"]:
+        r = conn.execute(
+            "SELECT MIN(date), MAX(date), COUNT(*) FROM price_history WHERE symbol=?", (sym,)
+        ).fetchone()
+        if r and r[0]:
+            print(f"   {sym}: {r[0]} → {r[1]} ({r[2]} rows)")
     conn.close()
 
-    print("\n✅ Step 2 complete! Your database is ready.")
+    print("\n✅ Step 2 complete! Merolagani scraper is working.")
