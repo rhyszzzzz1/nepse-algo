@@ -48,6 +48,9 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+# -- ADMIN KEY (Change this if you want) --
+SCRAPE_KEY = "antigravity_trigger_2026"
+
 def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
 
@@ -167,6 +170,37 @@ def get_company_dividends(symbol):
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
+
+# -- REMOTE SCRAPE TRIGGER --
+@app.route("/api/scrape/start", methods=["POST", "GET"])
+def trigger_scrape():
+    # Basic security
+    key = request.args.get("key") or request.json.get("key") if request.is_json else None
+    if key != SCRAPE_KEY:
+        return jsonify({"status": "unauthorized"}), 401
+        
+    import threading
+    import subprocess
+    
+    def run_scraper():
+        print("[Admin] Starting remote-triggered scrape...")
+        try:
+            # Run the pipeline script as a subprocess
+            result = subprocess.run([sys.executable, "src/data/merolagani_pipeline.py"], 
+                                    capture_output=True, text=True)
+            print("[Admin] Scrape Complete.")
+            print(result.stdout)
+        except Exception as e:
+            print(f"[Admin] Scrape Failed: {e}")
+
+    thread = threading.Thread(target=run_scraper)
+    thread.start()
+    
+    return jsonify({
+        "status": "triggered",
+        "message": "Scraper started in background on Railway server.",
+        "time": datetime.now().isoformat()
+    })
 
 
 # ── MARKET OVERVIEW ───────────────────────────────────────────────────────────
