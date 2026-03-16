@@ -33,9 +33,9 @@ OUTPUT_DIR = os.path.join(ROOT, "data", "merolagani_output")
 
 # ---------- TESTING ----------
 LIMIT_SYMBOLS = None               # None = process all symbols
-MAX_FLOORSHEET_PAGES_OVERRIDE = 10 # None = auto
-MAX_NEWS_PAGES_OVERRIDE = 5        # None = auto
-MAX_DIVIDEND_PAGES_OVERRIDE = 5    # None = auto
+MAX_FLOORSHEET_PAGES_OVERRIDE = None # None = auto
+MAX_NEWS_PAGES_OVERRIDE = None        # None = auto
+MAX_DIVIDEND_PAGES_OVERRIDE = None    # None = auto
 
 # ---------- DATES ----------
 OHLCV_START_DATE = "2025-01-01"
