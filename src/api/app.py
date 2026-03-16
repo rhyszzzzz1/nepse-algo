@@ -13,6 +13,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import sqlite3
+import re
 from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -50,6 +51,21 @@ def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
 
 
+def discover_endpoints():
+    """Build endpoint list dynamically from registered Flask routes."""
+    endpoints = []
+    for rule in app.url_map.iter_rules():
+        if rule.endpoint == "static":
+            continue
+
+        path = re.sub(r"<([^>]+)>", lambda m: f"<{m.group(1).upper()}>", rule.rule)
+        methods = sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"})
+        for method in methods:
+            endpoints.append(f"{method} {path}")
+
+    return sorted(endpoints, key=lambda e: (e.split(" ", 1)[1], e))
+
+
 # ── ROOT INDEX ────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -57,32 +73,7 @@ def index():
         "name":    "NEPSE Algorithmic Trading API",
         "version": "1.0",
         "status":  "running",
-        "endpoints": [
-            "GET  /api/health",
-            "GET  /api/market-summary",
-            "GET  /api/market/overview",
-            "GET  /api/top-movers",
-            "GET  /api/companies",
-            "GET  /api/sectors",
-            "GET  /api/signals?signal=BUY&limit=20",
-            "GET  /api/signals/<SYMBOL>",
-            "GET  /api/price/<SYMBOL>?days=90",
-            "GET  /api/stock/<SYMBOL>",
-            "GET  /api/stock/<SYMBOL>/ohlcv",
-            "GET  /api/company/<SYMBOL>",
-            "GET  /api/company/<SYMBOL>/news",
-            "GET  /api/company/<SYMBOL>/dividends",
-            "GET  /api/screener",
-            "GET  /api/backtest",
-            "GET  /api/backtest/<SYMBOL>",
-            "POST /api/run-backtest",
-            "GET  /api/run-backtest/<SYMBOL>",
-            "GET  /api/optimizer/leaderboard",
-            "GET  /api/optimizer/<SYMBOL>",
-            "GET  /api/rules",
-            "GET  /api/rules/<SYMBOL>",
-            "GET  /api/init-data",
-        ]
+        "endpoints": discover_endpoints(),
     })
 
 
