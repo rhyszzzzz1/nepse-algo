@@ -8,7 +8,7 @@ os.environ.pop("DATABASE_URL", None)
 os.environ.pop("POSTGRES_URL", None)
 
 # Fix import paths for Railway
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
@@ -49,6 +49,26 @@ SCRAPE_KEY = "antigravity_trigger_2026"
 
 def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
+
+
+def floor_sheet_table_exists(conn):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='floor_sheet'"
+    ).fetchone()
+    return row is not None
+
+
+def get_latest_floor_sheet_date(conn):
+    row = conn.execute("SELECT MAX(date) FROM floor_sheet").fetchone()
+    return row[0] if row and row[0] else None
+
+
+def parse_pagination(default_limit=5000, max_limit=20000):
+    page = max(int(request.args.get("page", 1)), 1)
+    limit = max(int(request.args.get("limit", default_limit)), 1)
+    limit = min(limit, max_limit)
+    offset = (page - 1) * limit
+    return page, limit, offset
 
 
 def discover_endpoints():
@@ -677,6 +697,7 @@ def top_movers():
 
         losers = rows_to_list(conn.execute("""
             SELECT symbol, close, price_change_pct, volume, market_condition
+            FROM   clean_price_history
             WHERE  date = ? AND price_change_pct IS NOT NULL
             ORDER  BY price_change_pct ASC LIMIT 5
         """, (latest_date,)).fetchall())
@@ -883,8 +904,12 @@ def broker_update():
     """Trigger daily floor sheet fetch + broker_summary recompute (background)."""
     def _run():
         try:
-            sys.path.insert(0, os.path.join(ROOT, "src", "data"))
-            from floorsheet_pipeline import run_daily_update
+            try:
+                from src.data.floorsheet_pipeline import run_daily_update
+            except ImportError:
+                import importlib
+                sys.path.insert(0, os.path.join(ROOT, "src", "data"))
+                run_daily_update = importlib.import_module("floorsheet_pipeline").run_daily_update
             run_daily_update()
         except Exception as e:
             import traceback
@@ -893,6 +918,146 @@ def broker_update():
     import threading
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "started", "message": "Daily floor sheet update running in background"})
+
+
+@app.route("/api/floorsheet/<symbol>")
+def floorsheet_symbol(symbol):
+    days = int(request.args.get("days", 30))
+    sym = symbol.upper()
+    page, limit, offset = parse_pagination()
+    conn = get_db()
+    try:
+        if not floor_sheet_table_exists(conn):
+            return jsonify({"error": "floor_sheet table not found"}), 404
+
+        cutoff = conn.execute(
+            "SELECT date FROM (SELECT DISTINCT date FROM floor_sheet WHERE symbol=? ORDER BY date DESC LIMIT ?) ORDER BY date ASC LIMIT 1",
+            (sym, days)
+        ).fetchone()
+        if not cutoff:
+            return jsonify({"error": f"No floorsheet data for '{sym}'"}), 404
+
+        since = cutoff[0]
+        latest_date = conn.execute(
+            "SELECT MAX(date) FROM floor_sheet WHERE symbol=?", (sym,)
+        ).fetchone()[0]
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM floor_sheet WHERE symbol=? AND date>=?",
+            (sym, since)
+        ).fetchone()[0]
+        dates_count = conn.execute(
+            "SELECT COUNT(DISTINCT date) FROM floor_sheet WHERE symbol=? AND date>=?",
+            (sym, since)
+        ).fetchone()[0]
+
+        trades = rows_to_list(conn.execute("""
+            SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
+            FROM floor_sheet
+            WHERE symbol=? AND date>=?
+            ORDER BY date DESC, id DESC
+            LIMIT ? OFFSET ?
+        """, (sym, since, limit, offset)).fetchall())
+
+        return jsonify({
+            "symbol": sym,
+            "days": days,
+            "since": since,
+            "latest_date": latest_date,
+            "dates_count": dates_count,
+            "page": page,
+            "limit": limit,
+            "count": len(trades),
+            "total_count": total_count,
+            "has_more": offset + len(trades) < total_count,
+            "trades": trades,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/floorsheet/date/<date_str>")
+def floorsheet_by_date(date_str):
+    page, limit, offset = parse_pagination()
+    conn = get_db()
+    try:
+        if not floor_sheet_table_exists(conn):
+            return jsonify({"error": "floor_sheet table not found"}), 404
+
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM floor_sheet WHERE date=?", (date_str,)
+        ).fetchone()[0]
+        if total_count == 0:
+            return jsonify({"error": f"No floorsheet data for '{date_str}'"}), 404
+
+        symbol_count = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM floor_sheet WHERE date=?", (date_str,)
+        ).fetchone()[0]
+        trades = rows_to_list(conn.execute("""
+            SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
+            FROM floor_sheet
+            WHERE date=?
+            ORDER BY symbol ASC, id ASC
+            LIMIT ? OFFSET ?
+        """, (date_str, limit, offset)).fetchall())
+
+        return jsonify({
+            "date": date_str,
+            "symbol_count": symbol_count,
+            "page": page,
+            "limit": limit,
+            "count": len(trades),
+            "total_count": total_count,
+            "has_more": offset + len(trades) < total_count,
+            "trades": trades,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/floorsheet/latest")
+def floorsheet_latest():
+    page, limit, offset = parse_pagination()
+    conn = get_db()
+    try:
+        if not floor_sheet_table_exists(conn):
+            return jsonify({"error": "floor_sheet table not found"}), 404
+
+        latest_date = get_latest_floor_sheet_date(conn)
+        if not latest_date:
+            return jsonify({"error": "No floorsheet data available"}), 404
+
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM floor_sheet WHERE date=?", (latest_date,)
+        ).fetchone()[0]
+        symbol_count = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM floor_sheet WHERE date=?", (latest_date,)
+        ).fetchone()[0]
+        trades = rows_to_list(conn.execute("""
+            SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
+            FROM floor_sheet
+            WHERE date=?
+            ORDER BY symbol ASC, id ASC
+            LIMIT ? OFFSET ?
+        """, (latest_date, limit, offset)).fetchall())
+
+        return jsonify({
+            "date": latest_date,
+            "symbol_count": symbol_count,
+            "page": page,
+            "limit": limit,
+            "count": len(trades),
+            "total_count": total_count,
+            "has_more": offset + len(trades) < total_count,
+            "trades": trades,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
 
 
 @app.route("/api/broker/summary/<symbol>")

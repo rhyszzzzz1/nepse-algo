@@ -17,7 +17,21 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
-from floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
+try:
+    from active_symbols import load_active_symbols
+except ImportError:
+    try:
+        from data.active_symbols import load_active_symbols
+    except ImportError:
+        from src.data.active_symbols import load_active_symbols
+
+try:
+    from floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
+except ImportError:
+    try:
+        from data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
+    except ImportError:
+        from src.data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
 
 # =========================================================
 # USER SETTINGS
@@ -47,11 +61,11 @@ FLOOR_END_DATE = datetime.now().strftime("%Y-%m-%d")
 
 # ---------- NETWORK ----------
 REQUEST_TIMEOUT = 40
-SLEEP_BETWEEN_REQUESTS = 0.5
+SLEEP_BETWEEN_REQUESTS = 0.75
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/122.0.0.0 Safari/537.36"
 )
 
 BASE_MEROLAGANI = "https://www.merolagani.com"
@@ -154,6 +168,26 @@ def parse_aspx_delta_tables(text: str) -> List[pd.DataFrame]:
             pass
     return dfs
 
+
+def extract_aspx_updatepanel_fragments(text: str) -> List[str]:
+    fragments = []
+    pattern = re.compile(r"\|\d+\|(\d+)\|updatePanel\|([^|]+)\|")
+    pos = 0
+
+    while True:
+        match = pattern.search(text, pos)
+        if not match:
+            break
+
+        length = int(match.group(1))
+        start = match.end()
+        fragment = text[start:start + length]
+        if fragment:
+            fragments.append(fragment)
+        pos = start + length
+
+    return fragments
+
 def try_read_html_tables(text: str) -> List[pd.DataFrame]:
     dfs = []
     try:
@@ -161,7 +195,58 @@ def try_read_html_tables(text: str) -> List[pd.DataFrame]:
     except Exception:
         pass
     dfs.extend(parse_aspx_delta_tables(text))
+    for fragment in extract_aspx_updatepanel_fragments(text):
+        try:
+            dfs.extend(pd.read_html(io.StringIO(fragment)))
+        except Exception:
+            pass
+        dfs.extend(parse_aspx_delta_tables(fragment))
     return dfs
+
+
+def get_soup_from_response(text: str) -> BeautifulSoup:
+    fragments = extract_aspx_updatepanel_fragments(text)
+    html = fragments[0] if fragments else text
+    return BeautifulSoup(html, "html.parser")
+
+
+def html_table_to_dataframe(table, single_column_name: str = "value") -> pd.DataFrame:
+    header = None
+    rows = []
+
+    for tr in table.select("tr"):
+        ths = [clean_text(cell.get_text(" ", strip=True)) for cell in tr.select("th")]
+        tds = [clean_text(cell.get_text(" ", strip=True)) for cell in tr.select("td")]
+        cells = ths + tds if ths and not tds else [clean_text(cell.get_text(" ", strip=True)) for cell in tr.select("th,td")]
+        cells = [cell for cell in cells if cell != ""]
+        if not cells:
+            continue
+
+        if header is None and tr.select("th"):
+            header = dedupe_columns(cells)
+            continue
+
+        rows.append(cells)
+
+    if not rows:
+        return pd.DataFrame()
+
+    if header is None and all(len(row) == 1 for row in rows):
+        return pd.DataFrame([{single_column_name: row[0]} for row in rows if row[0]])
+
+    width = max(len(row) for row in rows)
+    if header is None:
+        header = [f"col_{i + 1}" for i in range(width)]
+    elif len(header) < width:
+        header = header + [f"col_{i + 1}" for i in range(len(header), width)]
+
+    normalized_rows = []
+    for row in rows:
+        if len(row) < len(header):
+            row = row + [None] * (len(header) - len(row))
+        normalized_rows.append(row[:len(header)])
+
+    return pd.DataFrame(normalized_rows, columns=header)
 
 
 # =========================================================
@@ -302,18 +387,27 @@ class MerolaganiScraper:
         resp = self.client.get(url)
         return resp.text, BeautifulSoup(resp.text, "html.parser")
 
-    def make_base_post_data(self, symbol: str, soup: BeautifulSoup) -> Dict[str, str]:
+    def extract_hidden_fields(self, soup: BeautifulSoup) -> Dict[str, str]:
         fields = {}
         for inp in soup.select("input[type='hidden']"):
-            if inp.get("name"):
-                fields[inp.get("name")] = inp.get("value", "")
+            name = inp.get("name")
+            value = inp.get("value", "")
+            if name:
+                fields[name] = value
+        return fields
+
+    def make_base_post_data(self, symbol: str, soup: BeautifulSoup) -> Dict[str, str]:
+        fields = self.extract_hidden_fields(soup)
 
         data = {
             "symbol": symbol.lower(),
             "ctl00$ASCompany$hdnAutoSuggest": "0",
             "ctl00$ASCompany$txtAutoSuggest": "",
             "ctl00$txtNews": "",
+            "ctl00$AutoSuggest1$hdnAutoSuggest": "0",
+            "ctl00$AutoSuggest1$txtAutoSuggest": "",
             "ctl00$ContentPlaceHolder1$CompanyDetail1$hdnStockSymbol": symbol.upper(),
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$StockGraph1$hdnStockSymbol": symbol.upper(),
             "__EVENTTARGET": "",
             "__EVENTARGUMENT": "",
             "__ASYNCPOST": "true",
@@ -341,30 +435,62 @@ class MerolaganiScraper:
         return resp.text
 
     def fetch_about_company(self, symbol: str) -> pd.DataFrame:
-        txt = self.postback_company_detail(symbol, "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab", "#divAbout", 
-            {"__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab"})
-        tables = try_read_html_tables(txt)
-        if not tables: return pd.DataFrame()
-        
-        df = max(tables, key=len).copy()
-        if df.shape[1] >= 2:
-            df = df.iloc[:, :2].copy()
-            df.columns = ["field_name", "field_value"]
-        else: return pd.DataFrame()
-        
-        df["field_name"] = df["field_name"].astype(str).map(clean_text)
-        df["field_value"] = df["field_value"].astype(str).map(clean_text)
-        df = df[(df["field_name"] != "") & (~df["field_name"].str.contains("updatepanel|viewstate|eventvalidation|scriptmanager", case=False, na=False))].copy()
+        html, soup = self.get_company_page(symbol)
+        table = soup.select_one("#divAbout table")
+        if table is None:
+            txt = self.postback_company_detail(symbol, "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab", "#divAbout",
+                {"__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab"})
+            soup = get_soup_from_response(txt)
+            table = soup.select_one("#divAbout table")
 
-        if df.empty: return pd.DataFrame()
+        if table is None:
+            return pd.DataFrame()
 
         row = {"symbol": symbol}
-        for _, r in df.iterrows():
-            key = normalize_sql_column(r["field_name"])
-            if key and key != "symbol":
-                row[key] = r["field_value"]
+        for tr in table.select("tr"):
+            key_cell = tr.select_one("th")
+            value_cell = tr.select_one("td")
+            if key_cell is None or value_cell is None:
+                continue
+
+            key = normalize_sql_column(clean_text(key_cell.get_text(" ", strip=True)))
+            value = clean_text(value_cell.get_text(" ", strip=True))
+            if key and key != "symbol" and value:
+                row[key] = value
+
+        if len(row) == 1:
+            return pd.DataFrame()
 
         return pd.DataFrame([row])
+
+    def fetch_news_page(self, symbol: str, page_number: int = 1) -> pd.DataFrame:
+        trigger = (
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab"
+            if page_number == 1
+            else "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$btnPaging"
+        )
+        extra = {
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnPCID": "PC1",
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnCurrentPage": str(page_number if page_number > 1 else 0),
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnPCID": "PC2",
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnCurrentPage": "0",
+            "__EVENTTARGET": "" if page_number > 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab",
+        }
+
+        txt = self.postback_company_detail(symbol, trigger, "#divNews", extra)
+        soup = get_soup_from_response(txt)
+        table = soup.select_one("#divNews table")
+        if table is None:
+            return pd.DataFrame()
+
+        df = html_table_to_dataframe(table, single_column_name="title")
+        if df.empty:
+            return pd.DataFrame()
+
+        df.columns = dedupe_columns([str(c) for c in df.columns])
+        df["symbol"] = symbol
+        df["page_number"] = page_number
+        return df
 
     def fetch_all_dividend(self, symbol: str) -> pd.DataFrame:
         frames = []
@@ -377,9 +503,15 @@ class MerolaganiScraper:
             }
             try:
                 txt = self.postback_company_detail(symbol, trigger, "#divDividend", extra)
-                tables = try_read_html_tables(txt)
-                if not tables: break
-                df = max(tables, key=len).copy()
+                soup = get_soup_from_response(txt)
+                table = soup.select_one("#divDividend table")
+                if table is None:
+                    break
+
+                df = html_table_to_dataframe(table)
+                if df.empty:
+                    break
+
                 df.columns = dedupe_columns([str(c) for c in df.columns])
                 df["symbol"] = symbol
                 df["page_number"] = page
@@ -393,24 +525,13 @@ class MerolaganiScraper:
     def fetch_all_news(self, symbol: str) -> pd.DataFrame:
         frames = []
         for page in range(1, (MAX_NEWS_PAGES_OVERRIDE or 50) + 1):
-            trigger = "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab" if page == 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$btnPaging"
-            extra = {
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnPCID": "PC1",
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnCurrentPage": str(page if page > 1 else 0),
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnPCID": "PC2",
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnCurrentPage": "0",
-                "__EVENTTARGET": "" if page > 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab",
-            }
             try:
-                txt = self.postback_company_detail(symbol, trigger, "#divNews", extra)
-                tables = try_read_html_tables(txt)
-                if not tables: break
-                df = max(tables, key=len).copy()
-                df.columns = dedupe_columns([str(c) for c in df.columns])
-                df["symbol"] = symbol
-                df["page_number"] = page
+                df = self.fetch_news_page(symbol, page_number=page)
+                if df.empty:
+                    break
                 frames.append(df)
-                if len(df) < 10: break
+                if len(df) < 10:
+                    break
             except Exception as e:
                 logger.warning(f"News page {page} failed for {symbol}: {e}")
                 break
@@ -426,14 +547,17 @@ class MerolaganiScraper:
             "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": str(page_number if page_number > 1 else 0),
             "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnPCID": "PC2",
             "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnCurrentPage": "0",
-            "__EVENTTARGET": trigger,
+            "__EVENTTARGET": "" if page_number > 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
         }
         txt = self.postback_company_detail(symbol, trigger, "#divFloorsheet", extra)
-        tables = try_read_html_tables(txt)
-        if not tables: return pd.DataFrame()
+        soup = get_soup_from_response(txt)
+        table = soup.select_one("#divFloorsheet table")
+        if table is None:
+            return pd.DataFrame()
         
-        df = max(tables, key=len).copy()
-        if df.empty: return df
+        df = html_table_to_dataframe(table)
+        if df.empty:
+            return df
 
         df.columns = [normalize_sql_column(str(c)) for c in df.columns]
         rename_map = {}
@@ -451,7 +575,8 @@ class MerolaganiScraper:
         df = df.rename(columns=rename_map)
         expected = ["row_no", "date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]
         for col in expected:
-            if col not in df.columns: df[col] = None
+            if col not in df.columns:
+                df[col] = None
 
         df = df[expected].copy()
         df["symbol"] = symbol
@@ -477,6 +602,10 @@ class MerolaganiScraper:
 
 
 def get_all_active_symbols():
+    file_symbols = load_active_symbols()
+    if file_symbols:
+        return file_symbols
+
     try:
         conn = get_db()
         cursor = conn.cursor()

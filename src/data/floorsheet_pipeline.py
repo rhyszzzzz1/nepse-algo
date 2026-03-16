@@ -16,13 +16,27 @@ from io import StringIO
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from active_symbols import get_active_symbol_set
+except ImportError:
+    try:
+        from data.active_symbols import get_active_symbol_set
+    except ImportError:
+        from src.data.active_symbols import get_active_symbol_set
+
 # ── DB ────────────────────────────────────────────────────────────────────────
 ROOT    = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB_PATH = os.path.join(ROOT, "data", "nepse.db")
 if "RAILWAY_VOLUME_MOUNT_PATH" in os.environ:
     DB_PATH = os.path.join(os.environ["RAILWAY_VOLUME_MOUNT_PATH"], "nepse.db")
 
-from db_factory import get_db_connection
+try:
+    from db_factory import get_db_connection
+except ImportError:
+    try:
+        from data.db_factory import get_db_connection
+    except ImportError:
+        from src.data.db_factory import get_db_connection
 
 def get_db():
     return get_db_connection(DB_PATH)
@@ -118,6 +132,13 @@ def _save_rows(rows):
     """Bulk-insert floor_sheet rows. Returns count inserted."""
     if not rows:
         return 0
+
+    active_symbols = get_active_symbol_set()
+    if active_symbols:
+        rows = [row for row in rows if str(row[1]).upper() in active_symbols]
+        if not rows:
+            return 0
+
     conn = get_db()
     conn.executemany("""
         INSERT OR IGNORE INTO floor_sheet

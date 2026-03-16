@@ -17,6 +17,14 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 
+try:
+    from active_symbols import filter_active_symbols, get_active_symbol_set
+except ImportError:
+    try:
+        from data.active_symbols import filter_active_symbols, get_active_symbol_set
+    except ImportError:
+        from src.data.active_symbols import filter_active_symbols, get_active_symbol_set
+
 # Force SQLite — ignore any PostgreSQL environment variables
 os.environ.pop("DATABASE_URL", None)
 os.environ.pop("POSTGRES_URL", None)
@@ -169,6 +177,10 @@ def fetch_company_list():
                 rows.append({"symbol": symbol, "name": name, "sector": sector})
 
         df = pd.DataFrame(rows)
+        active_symbols = get_active_symbol_set()
+        if active_symbols:
+            df = df[df["symbol"].str.upper().isin(active_symbols)].copy()
+            print(f"   Filtered to {len(df)} active companies from active_symbols.txt")
         print(f"   Found {len(df)} companies")
 
         fetched_at = datetime.now().isoformat()
@@ -305,6 +317,7 @@ def fetch_all_price_histories(max_workers=3):
     conn = get_db()
     symbols = [row[0] for row in conn.execute("SELECT symbol FROM companies").fetchall()]
     conn.close()
+    symbols = filter_active_symbols(symbols)
 
     total = len(symbols)
     print(f"Fetching price history for {total} companies with {max_workers} workers...")
@@ -331,6 +344,11 @@ def fetch_all_price_histories(max_workers=3):
                 print(f"Progress: {completed}/{total} | ✅ {success} | ❌ {failed}")
 
     print(f"\n✅ Done. Success: {success} | Failed: {failed}")
+
+
+def fetch_all_price_history(max_workers=3):
+    """Compatibility alias used by the step runner."""
+    return fetch_all_price_histories(max_workers=max_workers)
 
 
 # ── FLOOR SHEET ────────────────────────────────────────────────────────────────

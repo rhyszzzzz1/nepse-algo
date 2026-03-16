@@ -9,14 +9,27 @@ import os
 # Force SQLite — ignore any PostgreSQL environment variables
 os.environ.pop("DATABASE_URL", None)
 os.environ.pop("POSTGRES_URL", None)
-import sqlite3
-from db import get_db
-import os
 import traceback
 from datetime import datetime
 
 import pandas as pd
 import ta
+
+try:
+    from db import get_db
+except ImportError:
+    try:
+        from src.db import get_db
+    except ImportError:
+        from data.db import get_db
+
+try:
+    from active_symbols import filter_active_symbols
+except ImportError:
+    try:
+        from data.active_symbols import filter_active_symbols
+    except ImportError:
+        from src.data.active_symbols import filter_active_symbols
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DB_PATH = "data/nepse.db"
@@ -222,6 +235,7 @@ def clean_all_symbols(max_workers=10):
     conn = get_db()
     symbols = [r[0] for r in conn.execute("SELECT symbol FROM companies").fetchall()]
     conn.close()
+    symbols = filter_active_symbols(symbols)
 
     total = len(symbols)
     print(f"\nCleaning {total} symbols using {max_workers} parallel workers...")
