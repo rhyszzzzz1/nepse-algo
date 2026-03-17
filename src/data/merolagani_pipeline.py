@@ -7,6 +7,7 @@ import io
 import json
 import time
 import math
+import argparse
 import sqlite3
 import logging
 import traceback
@@ -33,6 +34,14 @@ except ImportError:
     except ImportError:
         from src.data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
 
+try:
+    from fetcher import create_tables as create_market_tables, fetch_price_history
+except ImportError:
+    try:
+        from data.fetcher import create_tables as create_market_tables, fetch_price_history
+    except ImportError:
+        from src.data.fetcher import create_tables as create_market_tables, fetch_price_history
+
 # =========================================================
 # USER SETTINGS
 # =========================================================
@@ -52,11 +61,14 @@ MAX_NEWS_PAGES_OVERRIDE = None        # None = auto
 MAX_DIVIDEND_PAGES_OVERRIDE = None    # None = auto
 
 # ---------- DATES ----------
-OHLCV_START_DATE = "2025-01-01"
+# Practical full-history defaults for this project.
+# Use Unix epoch start so the scraper keeps everything available.
+OHLCV_START_DATE = "1970-01-01"
 OHLCV_END_DATE = datetime.now().strftime("%Y-%m-%d")
 
-# Floorsheet backfill ranges
-FLOOR_START_DATE = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+# Floorsheet data does not appear to exist as far back as OHLCV, so keep the
+# default full backfill bounded to the earliest practical market-wide range.
+FLOOR_START_DATE = "2020-01-01"
 FLOOR_END_DATE = datetime.now().strftime("%Y-%m-%d")
 
 # ---------- NETWORK ----------
@@ -187,6 +199,13 @@ def extract_aspx_updatepanel_fragments(text: str) -> List[str]:
         pos = start + length
 
     return fragments
+
+
+def extract_aspx_hidden_fields(text: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for name, value in re.findall(r"\|hiddenField\|([^|]+)\|([^|]*)", text):
+        fields[name] = value
+    return fields
 
 def try_read_html_tables(text: str) -> List[pd.DataFrame]:
     dfs = []
@@ -434,12 +453,127 @@ class MerolaganiScraper:
         resp = self.client.post(url, data=data, headers=headers)
         return resp.text
 
+    def _postback_company_detail_with_state(
+        self,
+        symbol: str,
+        state: Dict[str, str],
+        trigger_control: str,
+        active_tab_id: str,
+        extra_data: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """POST against CompanyDetail while preserving ASP.NET state across requests."""
+        url = f"{BASE_MEROLAGANI}/CompanyDetail.aspx?symbol={symbol}"
+
+        data = {
+            "symbol": symbol.lower(),
+            "ctl00$ASCompany$hdnAutoSuggest": "0",
+            "ctl00$ASCompany$txtAutoSuggest": "",
+            "ctl00$txtNews": "",
+            "ctl00$AutoSuggest1$hdnAutoSuggest": "0",
+            "ctl00$AutoSuggest1$txtAutoSuggest": "",
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$hdnStockSymbol": symbol.upper(),
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$StockGraph1$hdnStockSymbol": symbol.upper(),
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$hdnActiveTabID": active_tab_id,
+            "ctl00$ScriptManager1": f"ctl00$ContentPlaceHolder1$CompanyDetail1$tabPanel|{trigger_control}",
+            "__EVENTTARGET": "",
+            "__EVENTARGUMENT": "",
+            "__ASYNCPOST": "true",
+        }
+        data.update(state)
+        if extra_data:
+            data.update(extra_data)
+
+        headers = {
+            "X-MicrosoftAjax": "Delta=true",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer": url,
+        }
+        resp = self.client.post(url, data=data, headers=headers)
+        text = resp.text
+
+        # Keep viewstate/eventvalidation in sync for the next postback.
+        state.update(extract_aspx_hidden_fields(text))
+        for fragment in extract_aspx_updatepanel_fragments(text):
+            fragment_soup = BeautifulSoup(fragment, "html.parser")
+            state.update(self.extract_hidden_fields(fragment_soup))
+
+        return text
+
+    def _parse_floorsheet_response(self, symbol: str, text: str) -> pd.DataFrame:
+        soup = get_soup_from_response(text)
+        table = soup.select_one("#divFloorsheet table")
+        if table is None:
+            return pd.DataFrame()
+
+        df = html_table_to_dataframe(table)
+        if df.empty:
+            return df
+
+        df.columns = [normalize_sql_column(str(c)) for c in df.columns]
+        rename_map = {}
+        for c in df.columns:
+            lc = c.lower()
+            if "row" in lc and "no" in lc:
+                rename_map[c] = "row_no"
+            elif "transaction" in lc:
+                rename_map[c] = "transaction_no"
+            elif "buyer" in lc:
+                rename_map[c] = "buyer_broker"
+            elif "seller" in lc:
+                rename_map[c] = "seller_broker"
+            elif "quantity" in lc:
+                rename_map[c] = "quantity"
+            elif lc == "rate":
+                rename_map[c] = "rate"
+            elif "amount" in lc:
+                rename_map[c] = "amount"
+            elif lc == "date":
+                rename_map[c] = "date"
+
+        df = df.rename(columns=rename_map)
+        expected = ["row_no", "date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]
+        for col in expected:
+            if col not in df.columns:
+                df[col] = None
+
+        df = df[expected].copy()
+        df["symbol"] = symbol
+
+        for num_col in ["buyer_broker", "seller_broker", "quantity", "rate", "amount"]:
+            df[num_col] = pd.to_numeric(df[num_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+
+        return df
+
+    def _extract_total_pages(self, text: str) -> Optional[int]:
+        fragments = extract_aspx_updatepanel_fragments(text)
+        haystack = "\n".join(fragments) if fragments else text
+        match = re.search(r"Total\s+pages\s*:\s*(\d+)", haystack, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return max(1, int(match.group(1)))
+        except Exception:
+            return None
+
     def fetch_about_company(self, symbol: str) -> pd.DataFrame:
         html, soup = self.get_company_page(symbol)
         table = soup.select_one("#divAbout table")
         if table is None:
-            txt = self.postback_company_detail(symbol, "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab", "#divAbout",
-                {"__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab"})
+            state = self.extract_hidden_fields(soup)
+            txt = self._postback_company_detail_with_state(
+                symbol,
+                state,
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab",
+                "#divAbout",
+                {
+                    # About tab behaves as button submit in ASP.NET; sending the
+                    # button field is more reliable than relying only on EVENTTARGET.
+                    "__EVENTTARGET": "",
+                    "__EVENTARGUMENT": "",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$btnAboutTab": "",
+                },
+            )
             soup = get_soup_from_response(txt)
             table = soup.select_one("#divAbout table")
 
@@ -464,21 +598,15 @@ class MerolaganiScraper:
         return pd.DataFrame([row])
 
     def fetch_news_page(self, symbol: str, page_number: int = 1) -> pd.DataFrame:
-        trigger = (
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab"
-            if page_number == 1
-            else "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$btnPaging"
-        )
-        extra = {
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnPCID": "PC1",
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnCurrentPage": str(page_number if page_number > 1 else 0),
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnPCID": "PC2",
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnCurrentPage": "0",
-            "__EVENTTARGET": "" if page_number > 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab",
-        }
+        # Backward-compatible convenience wrapper; page retrieval is now fully
+        # stateful in fetch_all_news().
+        all_pages = self.fetch_all_news(symbol)
+        if all_pages.empty:
+            return all_pages
+        return all_pages[all_pages.get("page_number", 1) == page_number].copy()
 
-        txt = self.postback_company_detail(symbol, trigger, "#divNews", extra)
-        soup = get_soup_from_response(txt)
+    def _parse_news_response(self, symbol: str, text: str) -> pd.DataFrame:
+        soup = get_soup_from_response(text)
         table = soup.select_one("#divNews table")
         if table is None:
             return pd.DataFrame()
@@ -489,7 +617,6 @@ class MerolaganiScraper:
 
         df.columns = dedupe_columns([str(c) for c in df.columns])
         df["symbol"] = symbol
-        df["page_number"] = page_number
         return df
 
     def fetch_all_dividend(self, symbol: str) -> pd.DataFrame:
@@ -523,82 +650,202 @@ class MerolaganiScraper:
         return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
 
     def fetch_all_news(self, symbol: str) -> pd.DataFrame:
-        frames = []
-        for page in range(1, (MAX_NEWS_PAGES_OVERRIDE or 50) + 1):
-            try:
-                df = self.fetch_news_page(symbol, page_number=page)
+        try:
+            _, soup = self.get_company_page(symbol)
+            state = self.extract_hidden_fields(soup)
+
+            common = {
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnPCID": "PC1",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnPCID": "PC2",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews2$hdnCurrentPage": "0",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtNews": "",
+            }
+
+            # 1) Open news tab (page 1)
+            first_text = self._postback_company_detail_with_state(
+                symbol,
+                state,
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab",
+                "#divNews",
+                {
+                    **common,
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnCurrentPage": "0",
+                    "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$btnNewsTab": "",
+                },
+            )
+
+            frames: List[pd.DataFrame] = []
+            page1 = self._parse_news_response(symbol, first_text)
+            if page1.empty:
+                return pd.DataFrame()
+            page1["page_number"] = 1
+            frames.append(page1)
+
+            total_pages = self._extract_total_pages(first_text)
+            max_pages = MAX_NEWS_PAGES_OVERRIDE or total_pages or 250
+            if total_pages:
+                max_pages = min(max_pages, total_pages)
+
+            seen_signatures = {
+                tuple(page1.head(5).astype(str).itertuples(index=False, name=None))
+            }
+            empty_or_repeat_streak = 0
+
+            # News pagination on CompanyDetail behaves like floorsheet: after
+            # initial page, pager uses hdnCurrentPage values 2..N.
+            for page_index in range(2, max_pages + 1):
+                page_text = self._postback_company_detail_with_state(
+                    symbol,
+                    state,
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$btnPaging",
+                    "#divNews",
+                    {
+                        **common,
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$hdnCurrentPage": str(page_index),
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlNews1$btnPaging": "",
+                        "__EVENTTARGET": "",
+                        "__EVENTARGUMENT": "",
+                    },
+                )
+
+                df = self._parse_news_response(symbol, page_text)
                 if df.empty:
-                    break
+                    empty_or_repeat_streak += 1
+                    if total_pages or empty_or_repeat_streak >= 2:
+                        break
+                    continue
+
+                signature = tuple(df.head(5).astype(str).itertuples(index=False, name=None))
+                if signature in seen_signatures:
+                    empty_or_repeat_streak += 1
+                    if total_pages or empty_or_repeat_streak >= 2:
+                        break
+                    continue
+
+                seen_signatures.add(signature)
+                empty_or_repeat_streak = 0
+                df["page_number"] = page_index
                 frames.append(df)
-                if len(df) < 10:
-                    break
-            except Exception as e:
-                logger.warning(f"News page {page} failed for {symbol}: {e}")
-                break
-        return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
+
+            if not frames:
+                return pd.DataFrame()
+            return pd.concat(frames, ignore_index=True).drop_duplicates()
+        except Exception as e:
+            logger.warning(f"News pagination failed for {symbol}: {e}")
+            return pd.DataFrame()
 
     def fetch_floorsheet_for_date(self, symbol: str, market_date_filter: str, page_number: int = 1) -> pd.DataFrame:
-        trigger = "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet" if page_number == 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging"
-        extra = {
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$txtFloorsheetDateFilter": market_date_filter,
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$txtBuyerFilter": "",
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$txtSellerFilter": "",
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnPCID": "PC1",
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": str(page_number if page_number > 1 else 0),
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnPCID": "PC2",
-            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnCurrentPage": "0",
-            "__EVENTTARGET": "" if page_number > 1 else "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
-        }
-        txt = self.postback_company_detail(symbol, trigger, "#divFloorsheet", extra)
-        soup = get_soup_from_response(txt)
-        table = soup.select_one("#divFloorsheet table")
-        if table is None:
-            return pd.DataFrame()
-        
-        df = html_table_to_dataframe(table)
-        if df.empty:
-            return df
-
-        df.columns = [normalize_sql_column(str(c)) for c in df.columns]
-        rename_map = {}
-        for c in df.columns:
-            lc = c.lower()
-            if "row" in lc and "no" in lc: rename_map[c] = "row_no"
-            elif "transaction" in lc: rename_map[c] = "transaction_no"
-            elif "buyer" in lc: rename_map[c] = "buyer_broker"
-            elif "seller" in lc: rename_map[c] = "seller_broker"
-            elif "quantity" in lc: rename_map[c] = "quantity"
-            elif lc == "rate": rename_map[c] = "rate"
-            elif "amount" in lc: rename_map[c] = "amount"
-            elif lc == "date": rename_map[c] = "date"
-        
-        df = df.rename(columns=rename_map)
-        expected = ["row_no", "date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]
-        for col in expected:
-            if col not in df.columns:
-                df[col] = None
-
-        df = df[expected].copy()
-        df["symbol"] = symbol
-        
-        # VERY IMPORTANT FIX: Ensure numeric types for DB compatibility with nepse.db format
-        for num_col in ['buyer_broker', 'seller_broker', 'quantity', 'rate', 'amount']:
-            df[num_col] = pd.to_numeric(df[num_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-            
-        return df
+        # Keep backward compatibility for callers that request one specific page.
+        all_pages = self.fetch_all_floorsheet_pages(symbol, market_date_filter)
+        if all_pages.empty:
+            return all_pages
+        if page_number <= 1:
+            return all_pages[all_pages.get("page_number", 1) == 1].copy()
+        return all_pages[all_pages.get("page_number", 1) == page_number].copy()
 
     def fetch_all_floorsheet_pages(self, symbol: str, market_date_filter: str) -> pd.DataFrame:
-        frames = []
-        for page in range(1, (MAX_FLOORSHEET_PAGES_OVERRIDE or 50) + 1):
-            try:
-                df = self.fetch_floorsheet_for_date(symbol, market_date_filter, page_number=page)
-                if df.empty: break
+        try:
+            _, soup = self.get_company_page(symbol)
+            state = self.extract_hidden_fields(soup)
+
+            # 1) Open Floorsheet tab
+            self._postback_company_detail_with_state(
+                symbol,
+                state,
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab",
+                "#divFloorsheet",
+                {
+                    "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab": "",
+                },
+            )
+
+            common = {
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtFloorsheetDateFilter": market_date_filter,
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtBuyerFilter": "",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtSellerFilter": "",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnPCID": "PC1",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnPCID": "PC2",
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnCurrentPage": "0",
+            }
+
+            # 2) Search by date (page 1)
+            search_text = self._postback_company_detail_with_state(
+                symbol,
+                state,
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
+                "#divFloorsheet",
+                {
+                    **common,
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": "0",
+                    "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
+                },
+            )
+
+            frames: List[pd.DataFrame] = []
+            page1 = self._parse_floorsheet_response(symbol, search_text)
+            if page1.empty:
+                return pd.DataFrame()
+            page1["page_number"] = 1
+            frames.append(page1)
+
+            total_pages = self._extract_total_pages(search_text)
+            max_pages = MAX_FLOORSHEET_PAGES_OVERRIDE or total_pages or 250
+            if total_pages:
+                max_pages = min(max_pages, total_pages)
+
+            # 3) Page through all available pages for the selected date.
+            seen_signatures = {
+                tuple(page1[["date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]].head(5).astype(str).itertuples(index=False, name=None))
+            }
+            empty_or_repeat_streak = 0
+
+            # Merolagani floorsheet pager uses page index 0 for the initial
+            # search page; subsequent pages are addressed with indices 2..N.
+            for page_index in range(2, max_pages + 1):
+                page_text = self._postback_company_detail_with_state(
+                    symbol,
+                    state,
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging",
+                    "#divFloorsheet",
+                    {
+                        **common,
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": str(page_index),
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging": "",
+                        "__EVENTTARGET": "",
+                        "__EVENTARGUMENT": "",
+                    },
+                )
+
+                df = self._parse_floorsheet_response(symbol, page_text)
+                if df.empty:
+                    empty_or_repeat_streak += 1
+                    if total_pages or empty_or_repeat_streak >= 2:
+                        break
+                    continue
+
+                signature = tuple(df[["date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]].head(5).astype(str).itertuples(index=False, name=None))
+                if signature in seen_signatures:
+                    empty_or_repeat_streak += 1
+                    if total_pages or empty_or_repeat_streak >= 2:
+                        break
+                    continue
+
+                seen_signatures.add(signature)
+                empty_or_repeat_streak = 0
+                df["page_number"] = page_index
                 frames.append(df)
-                if len(df) < 100: break
-            except Exception as e:
-                logger.warning(f"Floorsheet failed {symbol} @ {market_date_filter}: {e}")
-                break
-        return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
+
+            if not frames:
+                return pd.DataFrame()
+
+            return pd.concat(frames, ignore_index=True).drop_duplicates(
+                subset=["symbol", "date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]
+            )
+        except Exception as e:
+            logger.warning(f"Floorsheet failed {symbol} @ {market_date_filter}: {e}")
+            return pd.DataFrame()
 
 
 def get_all_active_symbols():
@@ -616,8 +863,54 @@ def get_all_active_symbols():
     except:
         return []
 
-def run_pipeline():
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="Run the Merolagani data pipeline")
+    parser.add_argument("--full-history", action="store_true", help="Run a full historical backfill through today")
+    parser.add_argument("--ohlcv-start", default=None, help="OHLCV start date in YYYY-MM-DD format")
+    parser.add_argument("--ohlcv-end", default=OHLCV_END_DATE, help="OHLCV end date in YYYY-MM-DD format")
+    parser.add_argument("--floor-start", default=None, help="Floorsheet start date in YYYY-MM-DD format")
+    parser.add_argument("--floor-end", default=FLOOR_END_DATE, help="Floorsheet end date in YYYY-MM-DD format")
+    parser.add_argument("--limit-symbols", type=int, default=LIMIT_SYMBOLS, help="Limit the number of symbols processed")
+    parser.add_argument("--resume-after-symbol", default=None, help="Only process symbols after this symbol (exclusive), e.g. SCB")
+    parser.add_argument("--skip-ohlcv", action="store_true", help="Skip OHLCV fetching")
+    parser.add_argument("--skip-floorsheet", action="store_true", help="Skip floorsheet fetching")
+    return parser.parse_args()
+
+
+def resolve_run_dates(args):
+    ohlcv_start = args.ohlcv_start or OHLCV_START_DATE
+    floor_start = args.floor_start or FLOOR_START_DATE
+    if args.full_history:
+        ohlcv_start = args.ohlcv_start or OHLCV_START_DATE
+        floor_start = args.floor_start or FLOOR_START_DATE
+    return {
+        "ohlcv_start": ohlcv_start,
+        "ohlcv_end": args.ohlcv_end or OHLCV_END_DATE,
+        "floor_start": floor_start,
+        "floor_end": args.floor_end or FLOOR_END_DATE,
+    }
+
+
+def run_pipeline(args=None):
+    if args is None:
+        args = parse_cli_args()
+
+    date_config = resolve_run_dates(args)
     logger.info("Initializing Native Merolagani Pipeline Integration")
+    logger.info(
+        "Run config: full_history=%s ohlcv=%s..%s floorsheet=%s..%s limit_symbols=%s skip_ohlcv=%s skip_floorsheet=%s",
+        args.full_history,
+        date_config["ohlcv_start"],
+        date_config["ohlcv_end"],
+        date_config["floor_start"],
+        date_config["floor_end"],
+        args.limit_symbols,
+        args.skip_ohlcv,
+        args.skip_floorsheet,
+    )
+
+    create_market_tables()
     storage = DataStorage(DB_PATH, OUTPUT_DIR)
     scraper = MerolaganiScraper(storage)
 
@@ -633,14 +926,38 @@ def run_pipeline():
         storage.save_df_to_sqlite(instruments_df, "companies", if_exists="replace", add_fetched_at=False)
         logger.info(f"Saved {len(all_symbols)} instruments to company index")
 
-        process_symbols = all_symbols[:LIMIT_SYMBOLS] if LIMIT_SYMBOLS else all_symbols
+        process_symbols = all_symbols
+        if args.resume_after_symbol:
+            marker = args.resume_after_symbol.strip().upper()
+            process_symbols = [s for s in process_symbols if str(s).upper() > marker]
+            logger.info("Resume filter active: processing symbols after %s (%d symbols)", marker, len(process_symbols))
+
+        if args.limit_symbols:
+            process_symbols = process_symbols[:args.limit_symbols]
+
         logger.info(f"Processing details for {len(process_symbols)} symbols...")
 
         for symbol in process_symbols:
+            if not args.skip_ohlcv:
+                try:
+                    ohlcv_df = fetch_price_history(
+                        symbol,
+                        start_date=date_config["ohlcv_start"],
+                        end_date=date_config["ohlcv_end"],
+                    )
+                    if ohlcv_df is not None and not ohlcv_df.empty:
+                        logger.info(f"Saved {len(ohlcv_df)} OHLCV rows for {symbol}")
+                except Exception as e:
+                    logger.error(f"OHLCV failed for {symbol}: {e}")
+
             # 2. ABOUT INFO (cleans up junk as per request logic)
             try:
                 about_df = scraper.fetch_about_company(symbol)
                 if not about_df.empty:
+                    # about_company has symbol as primary key; reruns should
+                    # update existing rows, not fail on duplicate inserts.
+                    storage.conn.execute("DELETE FROM about_company WHERE symbol = ?", (symbol,))
+                    storage.conn.commit()
                     storage.save_df_to_sqlite(about_df, "about_company", if_exists="append")
                     logger.info(f"Saved about info for {symbol}")
             except Exception as e:
@@ -665,18 +982,18 @@ def run_pipeline():
                 logger.error(f"Dividend failed for {symbol}: {e}")
                 
             # 5. FLOORSHEET
-            try:
-                start_dt = pd.to_datetime(FLOOR_START_DATE)
-                end_dt = pd.to_datetime(FLOOR_END_DATE)
-                for dt in daterange(start_dt, end_dt):
-                    dt_str = to_mmddyyyy(dt)
-                    df_floor = scraper.fetch_all_floorsheet_pages(symbol, dt_str)
-                    if not df_floor.empty:
-                        # Append directly into standard nepse floor_sheet!
-                        storage.save_df_to_sqlite(df_floor, "floor_sheet", if_exists="append")
-                        logger.info(f"Saved {len(df_floor)} floorsheet rows for {symbol} on {dt_str}")
-            except Exception as e:
-                logger.error(f"Floorsheet failed for {symbol}: {e}")
+            if not args.skip_floorsheet:
+                try:
+                    start_dt = pd.to_datetime(date_config["floor_start"])
+                    end_dt = pd.to_datetime(date_config["floor_end"])
+                    for dt in daterange(start_dt, end_dt):
+                        dt_str = to_mmddyyyy(dt)
+                        df_floor = scraper.fetch_all_floorsheet_pages(symbol, dt_str)
+                        if not df_floor.empty:
+                            storage.save_df_to_sqlite(df_floor, "floor_sheet", if_exists="append")
+                            logger.info(f"Saved {len(df_floor)} floorsheet rows for {symbol} on {dt_str}")
+                except Exception as e:
+                    logger.error(f"Floorsheet failed for {symbol}: {e}")
 
         # Post-process the databases
         storage.create_indexes()

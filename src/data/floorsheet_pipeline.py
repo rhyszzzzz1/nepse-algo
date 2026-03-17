@@ -42,6 +42,18 @@ def get_db():
     return get_db_connection(DB_PATH)
 
 
+# ── RAW RETENTION POLICY ─────────────────────────────────────────────────────
+# How many days of raw floor_sheet rows to keep after aggregation.
+# 0 = delete raw rows immediately after broker_summary is computed (recommended
+#     for the rolling-year broker-summary workflow to keep the DB small).
+# N = keep the last N days of raw rows for trade-level drill-down.
+KEEP_RAW_DAYS = 0
+
+# How many calendar days of broker_summary to retain (rolling window).
+# Rows older than this are pruned when --prune-raw is used.
+BROKER_SUMMARY_KEEP_DAYS = 400   # ~13 months gives headroom beyond 1 year
+
+
 # ── ENSURE SCHEMA ─────────────────────────────────────────────────────────────
 def ensure_schema():
     conn = get_db()
@@ -123,10 +135,19 @@ def _is_nepse_holiday(dt):
     return dt.weekday() in (4, 5)
 
 def _dates_already_in_db():
+    """Return dates that have already been processed.
+    Checks both floor_sheet (raw) and broker_summary (aggregated+pruned) so
+    dates don't get re-fetched after raw rows have been pruned."""
     conn = get_db()
-    dates = {r[0] for r in conn.execute("SELECT DISTINCT date FROM floor_sheet").fetchall()}
+    raw_dates = {r[0] for r in conn.execute("SELECT DISTINCT date FROM floor_sheet").fetchall()}
+    # broker_summary is keyed by (date, symbol, broker) — any row for a date
+    # means that date was already fully processed and aggregated
+    try:
+        agg_dates = {r[0] for r in conn.execute("SELECT DISTINCT date FROM broker_summary").fetchall()}
+    except Exception:
+        agg_dates = set()
     conn.close()
-    return dates
+    return raw_dates | agg_dates
 
 def _save_rows(rows):
     """Bulk-insert floor_sheet rows. Returns count inserted."""
@@ -147,6 +168,46 @@ def _save_rows(rows):
     """, rows)
     conn.commit()
     n = len(rows)
+    conn.close()
+    return n
+
+
+# ── PRUNING HELPERS ───────────────────────────────────────────────────────────
+def prune_raw_floor_sheet(keep_days=None):
+    """
+    Delete raw floor_sheet rows to limit disk usage.
+    keep_days=0  → delete all raw rows (smallest DB, broker_summary already computed)
+    keep_days=N  → keep only the most recent N days, delete anything older
+    """
+    if keep_days is None:
+        keep_days = KEEP_RAW_DAYS
+    conn = get_db()
+    if keep_days <= 0:
+        n = conn.execute("SELECT COUNT(*) FROM floor_sheet").fetchone()[0]
+        conn.execute("DELETE FROM floor_sheet")
+    else:
+        cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        n = conn.execute("SELECT COUNT(*) FROM floor_sheet WHERE date < ?", (cutoff,)).fetchone()[0]
+        conn.execute("DELETE FROM floor_sheet WHERE date < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+    print(f"[Prune] Removed {n:,} raw floor_sheet rows (keep_days={keep_days})")
+    return n
+
+
+def prune_old_broker_summary(keep_days=None):
+    """
+    Delete broker_summary rows older than keep_days to enforce the rolling window.
+    """
+    if keep_days is None:
+        keep_days = BROKER_SUMMARY_KEEP_DAYS
+    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    conn = get_db()
+    n = conn.execute("SELECT COUNT(*) FROM broker_summary WHERE date < ?", (cutoff,)).fetchone()[0]
+    if n:
+        conn.execute("DELETE FROM broker_summary WHERE date < ?", (cutoff,))
+        conn.commit()
+        print(f"[Prune] Removed {n:,} broker_summary rows older than {cutoff}")
     conn.close()
     return n
 
@@ -264,17 +325,31 @@ def _ml_parse_table(soup_or_html):
     if table:
         for tr in table.find_all("tr")[1:]:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) < 6:
+            if len(tds) < 7:
                 continue
             try:
-                # Columns: # | Symbol | Buyer | Seller | Qty | Rate | Amount
+                # Merolagani can return either:
+                # 7 cols: # | Symbol | Buyer | Seller | Qty | Rate | Amount
+                # 8 cols: # | Transact. No. | Symbol | Buyer | Seller | Qty | Rate | Amount
+                offset = 1 if len(tds) >= 8 else 0
+                symbol_idx = 1 + offset
+                buyer_idx = 2 + offset
+                seller_idx = 3 + offset
+                qty_idx = 4 + offset
+                rate_idx = 5 + offset
+                amount_idx = 6 + offset
+
+                quantity = _float(tds[qty_idx])
+                rate = _float(tds[rate_idx])
+                amount = _float(tds[amount_idx]) if len(tds) > amount_idx else round(quantity * rate, 2)
+
                 rows.append({
-                    "symbol":        tds[1].upper(),
-                    "buyer_broker":  _int(tds[2]),
-                    "seller_broker": _int(tds[3]),
-                    "quantity":      _float(tds[4]),
-                    "rate":          _float(tds[5]),
-                    "amount":        _float(tds[6]) if len(tds) > 6 else round(_float(tds[4]) * _float(tds[5]), 2),
+                    "symbol":        tds[symbol_idx].upper(),
+                    "buyer_broker":  _int(tds[buyer_idx]),
+                    "seller_broker": _int(tds[seller_idx]),
+                    "quantity":      quantity,
+                    "rate":          rate,
+                    "amount":        amount,
                 })
             except Exception:
                 continue
@@ -303,6 +378,82 @@ def _ml_parse_delta(raw):
         pos = start + length
     return best or None
 
+def _ml_fetch_with_playwright(date_str_ymd, ml_date):
+    """Browser-based fallback for dates blocked by anti-bot/server-error pages."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        print("  [Playwright] not installed, cannot use browser fallback")
+        return [], 0
+
+    all_rows = []
+    total_pages = 0
+    def _safe_page_content(page_obj):
+        for _ in range(12):
+            try:
+                return page_obj.content()
+            except Exception:
+                page_obj.wait_for_timeout(250)
+        return ""
+
+    def _safe_table_html(page_obj):
+        for _ in range(12):
+            try:
+                table = page_obj.locator("table.table").first
+                if table.count() > 0:
+                    return table.evaluate("el => el.outerHTML")
+            except Exception:
+                pass
+            page_obj.wait_for_timeout(250)
+        return ""
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(ML_URL, wait_until="load", timeout=60000)
+            page.fill("#ctl00_ContentPlaceHolder1_txtFloorsheetDateFilter", ml_date)
+            page.click("#ctl00_ContentPlaceHolder1_lbtnSearchFloorsheet")
+            page.wait_for_load_state("load", timeout=60000)
+            page.wait_for_selector("table.table", timeout=60000)
+
+            html1 = _safe_page_content(page)
+            soup1 = BeautifulSoup(html1, "html.parser")
+            txt1 = soup1.get_text(" ", strip=True)
+            if "Could not find floorsheet" in txt1 or "No record" in txt1:
+                browser.close()
+                return [], 0
+
+            table_html1 = _safe_table_html(page)
+            page_rows, total_pages = _ml_parse_table(table_html1)
+            if not page_rows:
+                browser.close()
+                return [], 0
+
+            all_rows.extend(page_rows)
+
+            # Full-page pagination via page JS function used by the website
+            for page_no in range(2, total_pages + 1):
+                page.evaluate(
+                    f'changePageIndex("{page_no}","ctl00_ContentPlaceHolder1_PagerControl1_hdnCurrentPage","ctl00_ContentPlaceHolder1_PagerControl1_btnPaging")'
+                )
+                page.wait_for_load_state("load", timeout=60000)
+                page.wait_for_selector("table.table", timeout=60000)
+                page.wait_for_timeout(700)
+
+                table_htmln = _safe_table_html(page)
+                rowsn, _ = _ml_parse_table(table_htmln)
+                if not rowsn:
+                    break
+                all_rows.extend(rowsn)
+
+            browser.close()
+    except Exception as e:
+        print(f"  [{date_str_ymd}] Playwright fallback error: {e}")
+        return [], 0
+
+    return all_rows, total_pages
+
 def fetch_historical_via_merolagani(date_str_ymd):
     """
     Fetch full market floor sheet for one date from merolagani.com/Floorsheet.aspx
@@ -325,6 +476,11 @@ def fetch_historical_via_merolagani(date_str_ymd):
         payload = dict(state)
         payload["__EVENTTARGET"]   = "ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet"
         payload["__EVENTARGUMENT"] = ""
+        payload.setdefault("ctl00$ASCompany$hdnAutoSuggest", "0")
+        payload.setdefault("ctl00$ASCompany$txtAutoSuggest", "")
+        payload.setdefault("ctl00$txtNews", "")
+        payload.setdefault("ctl00$AutoSuggest1$hdnAutoSuggest", "0")
+        payload.setdefault("ctl00$AutoSuggest1$txtAutoSuggest", "")
         payload["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"]     = ml_date
         payload["ctl00$ContentPlaceHolder1$txtBuyerBrokerCodeFilter"]    = ""
         payload["ctl00$ContentPlaceHolder1$txtSellerBrokerCodeFilter"]   = ""
@@ -335,16 +491,58 @@ def fetch_historical_via_merolagani(date_str_ymd):
         payload["ctl00$ContentPlaceHolder1$PagerControl2$hdnPCID"]        = "PC2"
         payload["ctl00$ContentPlaceHolder1$PagerControl2$hdnCurrentPage"] = "0"
 
-        time.sleep(random.uniform(1.0, 2.0))
-        r1 = SESSION.post(ML_URL, data=payload, headers={
-            "Content-Type":            "application/x-www-form-urlencoded",
-            "Referer":                 ML_URL,
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest":          "document",
-            "Sec-Fetch-Mode":          "navigate",
-            "Sec-Fetch-Site":          "same-origin",
-        }, timeout=30)
-        r1.raise_for_status()
+        r1 = None
+        for attempt in range(1, 4):
+            time.sleep(random.uniform(1.0, 2.0))
+            r1 = SESSION.post(ML_URL, data=payload, headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": ML_URL,
+            }, timeout=30)
+            r1.raise_for_status()
+
+            # Merolagani sometimes serves a transient generic error page.
+            if "Something went wrong on the server" in r1.text:
+                if attempt < 3:
+                    print(f"  [{date_str_ymd}] Server error page returned, retrying ({attempt}/3)...")
+                    # Refresh form state before retrying the search POST
+                    r0 = SESSION.get(ML_URL, timeout=30)
+                    r0.raise_for_status()
+                    soup0 = BeautifulSoup(r0.text, "html.parser")
+                    state = _get_ml_state(soup0)
+                    payload = dict(state)
+                    payload["__EVENTTARGET"] = "ctl00$ContentPlaceHolder1$lbtnSearchFloorsheet"
+                    payload["__EVENTARGUMENT"] = ""
+                    payload.setdefault("ctl00$ASCompany$hdnAutoSuggest", "0")
+                    payload.setdefault("ctl00$ASCompany$txtAutoSuggest", "")
+                    payload.setdefault("ctl00$txtNews", "")
+                    payload.setdefault("ctl00$AutoSuggest1$hdnAutoSuggest", "0")
+                    payload.setdefault("ctl00$AutoSuggest1$txtAutoSuggest", "")
+                    payload["ctl00$ContentPlaceHolder1$txtFloorsheetDateFilter"] = ml_date
+                    payload["ctl00$ContentPlaceHolder1$txtBuyerBrokerCodeFilter"] = ""
+                    payload["ctl00$ContentPlaceHolder1$txtSellerBrokerCodeFilter"] = ""
+                    payload["ctl00$ContentPlaceHolder1$ASCompanyFilter$hdnAutoSuggest"] = "0"
+                    payload["ctl00$ContentPlaceHolder1$ASCompanyFilter$txtAutoSuggest"] = ""
+                    payload["ctl00$ContentPlaceHolder1$PagerControl1$hdnPCID"] = "PC1"
+                    payload["ctl00$ContentPlaceHolder1$PagerControl1$hdnCurrentPage"] = "0"
+                    payload["ctl00$ContentPlaceHolder1$PagerControl2$hdnPCID"] = "PC2"
+                    payload["ctl00$ContentPlaceHolder1$PagerControl2$hdnCurrentPage"] = "0"
+                    continue
+                print(f"  [{date_str_ymd}] Server error page returned after retries; trying Playwright fallback...")
+
+                all_rows, total_pages = _ml_fetch_with_playwright(date_str_ymd, ml_date)
+                if not all_rows:
+                    print(f"  [{date_str_ymd}] Playwright fallback found no data")
+                    return 0
+
+                db_rows = [
+                    (date_str_ymd, row["symbol"], row["buyer_broker"], row["seller_broker"],
+                     row["quantity"], row["rate"], row["amount"], fetched_at)
+                    for row in all_rows if row.get("symbol")
+                ]
+                saved = _save_rows(db_rows)
+                print(f"  [{date_str_ymd}] [Playwright] {total_pages}p | {len(all_rows)} trades | {saved} saved")
+                return saved
+            break
 
         soup1 = BeautifulSoup(r1.text, "html.parser")
 
@@ -596,10 +794,13 @@ def compute_broker_summary(dates=None):
 # ════════════════════════════════════════════════════════════════════════════
 # DAILY UPDATE  (call this from scheduler / API endpoint)
 # ════════════════════════════════════════════════════════════════════════════
-def run_daily_update():
+def run_daily_update(prune_raw=True):
     """
     Called every trading day after market close (4 PM NST).
-    Fetches today's floor sheet via NEPSE API → saves → computes broker_summary.
+    1. Tries NEPSE API first (fast, today only).
+    2. Falls back to Merolagani market-wide scrape if API returns nothing.
+    3. Recomputes broker_summary + daily_price.
+    4. Optionally prunes raw floor_sheet rows (prune_raw=True by default).
     """
     today = datetime.now().strftime("%Y-%m-%d")
     if _is_nepse_holiday(datetime.now()):
@@ -612,22 +813,31 @@ def run_daily_update():
     else:
         saved = fetch_today_via_api()
         if not saved:
-            print(f"[Daily] No floor sheet data for {today}")
+            print(f"[Daily] API returned no data — falling back to Merolagani scrape...")
+            saved = fetch_historical_via_merolagani(today)
+        if not saved:
+            print(f"[Daily] No floor sheet data available for {today}")
             return
 
     compute_broker_summary()
     compute_daily_price()
+    if prune_raw:
+        prune_raw_floor_sheet(keep_days=KEEP_RAW_DAYS)
+        prune_old_broker_summary(keep_days=BROKER_SUMMARY_KEEP_DAYS)
     print(f"[Daily] Update complete for {today}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # HISTORICAL BACKFILL  (fill the Oct 2021 → present gap)
 # ════════════════════════════════════════════════════════════════════════════
-def run_historical_backfill(days_back=None, start_date=None):
+def run_historical_backfill(days_back=None, start_date=None, prune_raw=False):
     """
-    Fills the gap from Oct 2021 → today using Merolagani scraping.
-    days_back: number of days to go back from today
-    start_date: YYYY-MM-DD string to start from (overrides days_back)
+    Fills dates from start_date (or days_back ago) through today using
+    the market-wide Merolagani floorsheet scraper.  One HTTP session per
+    date — much faster than the per-symbol company-detail approach.
+
+    prune_raw=True: delete raw floor_sheet rows after each batch aggregation
+                    to keep the DB small (broker_summary is kept).
     """
     ensure_schema()
     existing = _dates_already_in_db()
@@ -650,19 +860,26 @@ def run_historical_backfill(days_back=None, start_date=None):
         d += timedelta(days=1)
 
     print(f"[Backfill] {len(dates_to_fetch)} dates to fetch ({start} → {today})")
+    if prune_raw:
+        print(f"[Backfill] prune_raw=True — raw floor_sheet rows will be deleted after each batch")
 
     total = 0
     batch = 0
+    batch_dates = []
     for i, date_str in enumerate(dates_to_fetch):
         saved = fetch_historical_via_merolagani(date_str)
         total += saved
         batch += 1
+        batch_dates.append(date_str)
 
         # Compute summaries in batches to keep memory low
         if batch >= 20:
             compute_broker_summary()
             compute_daily_price()
+            if prune_raw:
+                prune_raw_floor_sheet(keep_days=KEEP_RAW_DAYS)
             batch = 0
+            batch_dates = []
 
         # Random pause every 50 requests to avoid rate limiting
         if (i + 1) % 50 == 0:
@@ -670,9 +887,12 @@ def run_historical_backfill(days_back=None, start_date=None):
             print(f"[Backfill] Pausing {pause:.0f}s to avoid rate limit...")
             time.sleep(pause)
 
-    # Final updates
+    # Final aggregation + optional prune
     compute_broker_summary()
     compute_daily_price()
+    if prune_raw:
+        prune_raw_floor_sheet(keep_days=KEEP_RAW_DAYS)
+        prune_old_broker_summary(keep_days=BROKER_SUMMARY_KEEP_DAYS)
     print(f"\n[Backfill] Complete! Total floor sheet rows saved: {total:,}")
 
 
@@ -682,31 +902,41 @@ def run_historical_backfill(days_back=None, start_date=None):
 # ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Floor sheet pipeline")
-    parser.add_argument("--daily",   action="store_true", help="Fetch today via NEPSE API")
-    parser.add_argument("--days",    type=int,            help="Backfill last N days via Merolagani")
-    parser.add_argument("--from",    dest="start",        help="Backfill from YYYY-MM-DD via Merolagani")
-    parser.add_argument("--all",     action="store_true", help="Full backfill Oct 2021 → today")
-    parser.add_argument("--summary", action="store_true", help="Recompute broker_summary only")
+    parser = argparse.ArgumentParser(description="Floor sheet pipeline — market-wide broker-summary approach")
+    parser.add_argument("--daily",        action="store_true", help="Fetch today (API → Merolagani fallback) + update broker_summary")
+    parser.add_argument("--rolling-year", action="store_true", help="Backfill last 365 days (market-wide, recommended for broker-summary)")
+    parser.add_argument("--days",         type=int,            help="Backfill last N days via Merolagani market-wide fetch")
+    parser.add_argument("--from",         dest="start",        help="Backfill from YYYY-MM-DD via Merolagani")
+    parser.add_argument("--all",          action="store_true", help="Full backfill Oct 2021 → today")
+    parser.add_argument("--summary",      action="store_true", help="Recompute broker_summary + daily_price only (no scrape)")
+    parser.add_argument("--prune-raw",    action="store_true", help="Delete raw floor_sheet rows after aggregation to save space")
+    parser.add_argument("--prune-only",   action="store_true", help="Only prune old raw + broker_summary rows, no scraping")
     args = parser.parse_args()
 
     ensure_schema()
 
-    if args.daily:
-        run_daily_update()
+    if args.prune_only:
+        prune_raw_floor_sheet(keep_days=KEEP_RAW_DAYS)
+        prune_old_broker_summary(keep_days=BROKER_SUMMARY_KEEP_DAYS)
+    elif args.daily:
+        run_daily_update(prune_raw=args.prune_raw)
+    elif args.rolling_year:
+        run_historical_backfill(days_back=365, prune_raw=args.prune_raw)
     elif args.summary:
         compute_broker_summary()
         compute_daily_price()
+        if args.prune_raw:
+            prune_raw_floor_sheet(keep_days=KEEP_RAW_DAYS)
+            prune_old_broker_summary(keep_days=BROKER_SUMMARY_KEEP_DAYS)
     elif args.days:
-
-        run_historical_backfill(days_back=args.days)
+        run_historical_backfill(days_back=args.days, prune_raw=args.prune_raw)
     elif args.start:
-        run_historical_backfill(start_date=args.start)
+        run_historical_backfill(start_date=args.start, prune_raw=args.prune_raw)
     elif args.all:
-        run_historical_backfill()
+        run_historical_backfill(prune_raw=args.prune_raw)
     else:
         # Default: daily update
-        run_daily_update()
+        run_daily_update(prune_raw=args.prune_raw)
 
     # Final stats
     conn = get_db()

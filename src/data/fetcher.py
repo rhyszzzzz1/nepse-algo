@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 
 try:
     from active_symbols import filter_active_symbols, get_active_symbol_set
@@ -57,6 +58,8 @@ SESSION.headers.update({
 
 BASE_URL   = "https://merolagani.com"
 COMPANY_LIST_URL = f"{BASE_URL}/CompanyList.aspx"
+COMPANY_DETAIL_URL = f"{BASE_URL}/CompanyDetail.aspx"
+SHARESANSAR_BASE_URL = "https://www.sharesansar.com"
 
 # Delay between requests (seconds) — randomised to be polite
 MIN_DELAY = 0.4
@@ -76,6 +79,358 @@ def _get(url, params=None, retries=3):
             wait = 2 ** attempt
             print(f"   Retry {attempt+1}/{retries} after {wait}s — {e}")
             time.sleep(wait)
+
+
+def _extract_hidden_fields(soup):
+    return {
+        inp.get("name"): inp.get("value", "")
+        for inp in soup.select("input[type='hidden']")
+        if inp.get("name")
+    }
+
+
+def _extract_aspx_updatepanel_fragments(text):
+    fragments = []
+    pattern = re.compile(r"\|\d+\|(\d+)\|updatePanel\|([^|]+)\|")
+    pos = 0
+    while True:
+        match = pattern.search(text, pos)
+        if not match:
+            break
+        length = int(match.group(1))
+        start = match.end()
+        fragment = text[start:start + length]
+        if fragment:
+            fragments.append(fragment)
+        pos = start + length
+    return fragments
+
+
+def _extract_aspx_hidden_fields(text):
+    fields = {}
+    # ASP.NET async responses can carry updated viewstate-like fields in
+    # hiddenField segments, e.g. |hiddenField|__VIEWSTATE|...|
+    for name, value in re.findall(r"\|hiddenField\|([^|]+)\|([^|]*)", text):
+        fields[name] = value
+    return fields
+
+
+def _get_company_detail_page(symbol):
+    url = f"{COMPANY_DETAIL_URL}?symbol={symbol}"
+    resp = _get(url)
+    return url, resp.text, BeautifulSoup(resp.text, "html.parser")
+
+
+def _normalize_market_date(value):
+    raw = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_number(value):
+    raw = str(value).replace(",", "").replace("%", "").strip()
+    return float(raw) if raw not in {"", "-", "--"} else 0.0
+
+
+def _extract_price_rows_from_html(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    rows = []
+
+    for table in soup.select("#ctl00_ContentPlaceHolder1_CompanyDetail1_divDataPrice table, #divHistory table, table"):
+        for tr in table.select("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.select("th,td")]
+            if len(cells) < 6:
+                continue
+
+            date_value = _normalize_market_date(cells[0])
+            if not date_value:
+                continue
+
+            # Price History generally includes Date, Open, High, Low, Close,
+            # Change%, Volume; but keep a tolerant fallback for older formats.
+            if len(cells) >= 7:
+                volume_index = 6
+            else:
+                volume_index = 5
+
+            try:
+                rows.append({
+                    "date": date_value,
+                    "open": _parse_number(cells[1]),
+                    "high": _parse_number(cells[2]),
+                    "low": _parse_number(cells[3]),
+                    "close": _parse_number(cells[4]),
+                    "volume": _parse_number(cells[volume_index]),
+                })
+            except Exception:
+                continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(subset=["date"])
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+
+def _fetch_price_history_from_merolagani_history_tab(symbol, max_pages=400):
+    print(f"   Fetching from Merolagani Price History tab for {symbol}...")
+    url, _, soup = _get_company_detail_page(symbol)
+
+    state = _extract_hidden_fields(soup)
+    base = {
+        "symbol": symbol.lower(),
+        "ctl00$ASCompany$hdnAutoSuggest": "0",
+        "ctl00$ASCompany$txtAutoSuggest": "",
+        "ctl00$txtNews": "",
+        "ctl00$AutoSuggest1$hdnAutoSuggest": "0",
+        "ctl00$AutoSuggest1$txtAutoSuggest": "",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$hdnStockSymbol": symbol.upper(),
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$hdnActiveTabID": "#divHistory",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$StockGraph1$hdnStockSymbol": symbol.upper(),
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$txtMarketDatePriceFilter": "",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory1$hdnPCID": "PC1",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory1$hdnCurrentPage": "0",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory2$hdnPCID": "PC2",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory2$hdnCurrentPage": "0",
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__ASYNCPOST": "true",
+    }
+
+    headers = {
+        "X-MicrosoftAjax": "Delta=true",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": url,
+        "Origin": "https://www.merolagani.com",
+    }
+
+    def post_event(script_target, event_target="", extra=None):
+        payload = {}
+        payload.update(state)
+        payload.update(base)
+        payload["ctl00$ScriptManager1"] = f"ctl00$ContentPlaceHolder1$CompanyDetail1$tabPanel|{script_target}"
+        payload["__EVENTTARGET"] = event_target
+        if extra:
+            payload.update(extra)
+
+        resp = SESSION.post(url, data=payload, headers=headers, timeout=20)
+        resp.raise_for_status()
+        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+        text = resp.text
+
+        state.update(_extract_aspx_hidden_fields(text))
+        for fragment in _extract_aspx_updatepanel_fragments(text):
+            fragment_soup = BeautifulSoup(fragment, "html.parser")
+            state.update(_extract_hidden_fields(fragment_soup))
+        return text
+
+    rows_by_date = {}
+
+    # 1) Open Price History tab
+    first = post_event(
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$btnHistoryTab",
+        event_target="ctl00$ContentPlaceHolder1$CompanyDetail1$btnHistoryTab",
+        extra={"ctl00$ContentPlaceHolder1$CompanyDetail1$btnHistoryTab": ""},
+    )
+
+    for fragment in _extract_aspx_updatepanel_fragments(first) or [first]:
+        df = _extract_price_rows_from_html(fragment)
+        for _, row in df.iterrows():
+            rows_by_date[row["date"]] = row.to_dict()
+
+    # 2) Page through transaction history
+    for page in range(2, max_pages + 1):
+        text = post_event(
+            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory1$btnPaging",
+            event_target="",
+            extra={
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory1$hdnCurrentPage": str(page),
+                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlTransactionHistory1$btnPaging": "",
+            },
+        )
+
+        page_rows = 0
+        for fragment in _extract_aspx_updatepanel_fragments(text) or [text]:
+            df = _extract_price_rows_from_html(fragment)
+            page_rows += len(df)
+            for _, row in df.iterrows():
+                rows_by_date[row["date"]] = row.to_dict()
+
+        if page_rows == 0:
+            break
+
+    if not rows_by_date:
+        return None
+
+    return (
+        pd.DataFrame(list(rows_by_date.values()))
+        .drop_duplicates(subset=["date"])
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+
+def _make_company_detail_post_data(symbol, soup):
+    data = {
+        "symbol": symbol.lower(),
+        "ctl00$ASCompany$hdnAutoSuggest": "0",
+        "ctl00$ASCompany$txtAutoSuggest": "",
+        "ctl00$txtNews": "",
+        "ctl00$AutoSuggest1$hdnAutoSuggest": "0",
+        "ctl00$AutoSuggest1$txtAutoSuggest": "",
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$hdnStockSymbol": symbol.upper(),
+        "ctl00$ContentPlaceHolder1$CompanyDetail1$StockGraph1$hdnStockSymbol": symbol.upper(),
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__ASYNCPOST": "true",
+    }
+    data.update(_extract_hidden_fields(soup))
+    return data
+
+
+def _post_company_detail(symbol, trigger_control, extra_data=None):
+    url, _, soup = _get_company_detail_page(symbol)
+    data = _make_company_detail_post_data(symbol, soup)
+    data["ctl00$ScriptManager1"] = f"ctl00$ContentPlaceHolder1$CompanyDetail1$tabPanel|{trigger_control}"
+    if extra_data:
+        data.update(extra_data)
+    headers = {
+        "X-MicrosoftAjax": "Delta=true",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": url,
+        "Origin": "https://www.merolagani.com",
+    }
+    resp = SESSION.post(url, data=data, headers=headers, timeout=20)
+    resp.raise_for_status()
+    time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+    return resp.text
+
+
+def _parse_price_history_table(table):
+    rows = []
+    for tr in table.select("tr"):
+        cells = [td.get_text(" ", strip=True) for td in tr.select("th,td")]
+        if len(cells) < 6:
+            continue
+        if cells[0].strip().lower() in {"date", "market date"}:
+            continue
+
+        date_value = cells[0].strip()
+        normalized_date = None
+        for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y"):
+            try:
+                normalized_date = datetime.strptime(date_value, fmt).strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+        if normalized_date is None:
+            continue
+
+        def parse_number(value):
+            raw = str(value).replace(",", "").strip()
+            return float(raw) if raw not in {"", "-", "--"} else 0.0
+
+        rows.append({
+            "date": normalized_date,
+            "open": parse_number(cells[1]),
+            "high": parse_number(cells[2]),
+            "low": parse_number(cells[3]),
+            "close": parse_number(cells[4]),
+            "volume": parse_number(cells[5]),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _fetch_price_history_from_sharesansar(symbol):
+    print(f"   Falling back to Sharesansar price history for {symbol}...")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": SESSION.headers["User-Agent"],
+        "Accept-Language": SESSION.headers["Accept-Language"],
+        "Referer": f"{SHARESANSAR_BASE_URL}/company/{symbol.lower()}",
+    })
+
+    company_url = f"{SHARESANSAR_BASE_URL}/company/{symbol.lower()}"
+    company_resp = session.get(company_url, timeout=20)
+    company_resp.raise_for_status()
+    soup = BeautifulSoup(company_resp.text, "html.parser")
+
+    token_tag = soup.select_one("meta[name=_token]")
+    company_tag = soup.select_one("#companyid")
+    if token_tag is None or company_tag is None:
+        return None
+
+    token = token_tag.get("content", "")
+    company_id = company_tag.get_text(strip=True)
+    if not token or not company_id:
+        return None
+
+    headers = {
+        "X-CSRF-Token": token,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": company_url,
+    }
+
+    frames = []
+    start = 0
+    page_size = 50
+    records_total = None
+
+    while records_total is None or start < records_total:
+        payload = {
+            "company": company_id,
+            "draw": str((start // page_size) + 1),
+            "start": str(start),
+            "length": str(page_size),
+        }
+        resp = session.post(
+            f"{SHARESANSAR_BASE_URL}/company-price-history",
+            headers=headers,
+            data=payload,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        rows = data.get("data") or []
+        if not rows:
+            break
+
+        records_total = int(data.get("recordsFiltered") or data.get("recordsTotal") or len(rows))
+        frame = pd.DataFrame([
+            {
+                "date": row.get("published_date"),
+                "open": float(str(row.get("open", 0)).replace(",", "") or 0),
+                "high": float(str(row.get("high", 0)).replace(",", "") or 0),
+                "low": float(str(row.get("low", 0)).replace(",", "") or 0),
+                "close": float(str(row.get("close", 0)).replace(",", "") or 0),
+                "volume": float(str(row.get("traded_quantity", 0)).replace(",", "") or 0),
+            }
+            for row in rows if row.get("published_date")
+        ])
+        if not frame.empty:
+            frames.append(frame)
+
+        start += len(rows)
+        if len(rows) < page_size:
+            break
+
+    if not frames:
+        return None
+
+    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df
 
 # ── CREATE TABLES ──────────────────────────────────────────────────────────────
 def create_tables():
@@ -207,20 +562,40 @@ def fetch_company_list():
 
 
 # ── PRICE HISTORY ──────────────────────────────────────────────────────────────
-# Merolagani price history endpoint (JSON, used by their own charts):
-#   GET https://merolagani.com/handlers/TechnicalChartHandler.ashx
-#       ?type=company&q=NABIL&resolution=D&from=<unix>&to=<unix>
+# Merolagani advanced chart endpoint (JSON, used by the current company chart):
+#   GET https://www.merolagani.com/handlers/TechnicalChartHandler.ashx
+#       ?type=get_advanced_chart&symbol=NLG&resolution=1D
+#       &rangeStartDate=<unix>&rangeEndDate=<unix>
+#       &from=&isAdjust=1&currencyCode=NPR
 #
-# Response JSON keys: t (timestamp), o, h, l, c, v (OHLCV)
-# This gives full daily OHLCV going back 10+ years for most stocks.
-# No login or token required.
+# Response JSON keys: t (timestamp), o, h, l, c, v, s
+# This currently returns working OHLCV data directly from Merolagani.
 
 CHART_HANDLER = f"{BASE_URL}/handlers/TechnicalChartHandler.ashx"
 
 def _unix(dt: datetime) -> int:
-    return int(dt.timestamp())
+    # datetime.timestamp() can raise OSError on Windows for early dates.
+    # Use explicit epoch arithmetic for cross-platform stability.
+    epoch = datetime(1970, 1, 1)
+    return int((dt - epoch).total_seconds())
 
-def fetch_price_history(symbol, years_back=15):
+def _coerce_history_date(value, default_time):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        dt = datetime.strptime(value, "%Y-%m-%d")
+        return dt.replace(
+            hour=default_time.hour,
+            minute=default_time.minute,
+            second=default_time.second,
+            microsecond=0,
+        )
+    raise TypeError(f"Unsupported date value: {value!r}")
+
+
+def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
     """
     Fetch full OHLCV price history for a stock symbol from Merolagani.
     Saves to price_history table.
@@ -228,48 +603,73 @@ def fetch_price_history(symbol, years_back=15):
     """
     print(f"Fetching price history for {symbol}...")
 
-    now  = datetime.now()
-    from_ts = _unix(now - timedelta(days=365 * years_back))
-    to_ts   = _unix(now)
+    now = datetime.now()
+    range_start = _coerce_history_date(start_date, datetime.min.replace(hour=0, minute=0, second=0))
+    range_end = _coerce_history_date(end_date, now)
 
-    params = {
-        "type":       "company",
-        "q":          symbol,
-        "resolution": "D",       # Daily bars
-        "from":       from_ts,
-        "to":         to_ts,
-    }
+    if range_end is None:
+        range_end = now
+    if range_start is None:
+        range_start = range_end - timedelta(days=365 * years_back)
+    if range_start > range_end:
+        raise ValueError(f"start_date must be on or before end_date for {symbol}")
+
+    from_ts = _unix(range_start)
+    to_ts = _unix(range_end)
 
     try:
-        resp = _get(CHART_HANDLER, params=params)
-        data = resp.json()
+        df = _fetch_price_history_from_merolagani_history_tab(symbol)
 
-        # Handler returns {"s": "ok", "t": [...], "o": [...], "h": [...], "l": [...], "c": [...], "v": [...]}
-        # or {"s": "no_data"} if symbol not found
-        if data.get("s") != "ok":
-            print(f"   No data for {symbol} (status: {data.get('s')})")
+        # Fallback 1: Merolagani advanced chart endpoint
+        if df is None or df.empty:
+            params = {
+                "type": "get_advanced_chart",
+                "symbol": symbol.upper(),
+                "resolution": "1D",
+                "rangeStartDate": from_ts,
+                "rangeEndDate": to_ts,
+                "from": "",
+                "isAdjust": 1,
+                "currencyCode": "NPR",
+            }
+            resp = _get(CHART_HANDLER, params=params)
+            try:
+                data = resp.json()
+            except (ValueError, RequestsJSONDecodeError):
+                data = None
+
+            if data:
+                timestamps = data.get("t", [])
+                opens      = data.get("o", [])
+                highs      = data.get("h", [])
+                lows       = data.get("l", [])
+                closes     = data.get("c", [])
+                volumes    = data.get("v", [])
+
+                if timestamps:
+                    df = pd.DataFrame({
+                        "date":   [datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") for ts in timestamps],
+                        "open":   [float(v or 0) for v in opens],
+                        "high":   [float(v or 0) for v in highs],
+                        "low":    [float(v or 0) for v in lows],
+                        "close":  [float(v or 0) for v in closes],
+                        "volume": [float(v or 0) for v in volumes],
+                    })
+
+        # Fallback 2: Sharesansar endpoint
+        if df is None or df.empty:
+            df = _fetch_price_history_from_sharesansar(symbol)
+            if df is None or df.empty:
+                print(f"   No price history rows found for {symbol}")
+                return None
+
+        if start_date is not None:
+            df = df[df["date"] >= _coerce_history_date(start_date, now).strftime("%Y-%m-%d")]
+        if end_date is not None:
+            df = df[df["date"] <= _coerce_history_date(end_date, now).strftime("%Y-%m-%d")]
+        if df.empty:
+            print(f"   No price history rows remained after date filtering for {symbol}")
             return None
-
-        timestamps = data.get("t", [])
-        opens      = data.get("o", [])
-        highs      = data.get("h", [])
-        lows       = data.get("l", [])
-        closes     = data.get("c", [])
-        volumes    = data.get("v", [])
-
-        if not timestamps:
-            print(f"   Empty response for {symbol}")
-            return None
-
-        # Build DataFrame
-        df = pd.DataFrame({
-            "date":   [datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") for ts in timestamps],
-            "open":   [float(v or 0) for v in opens],
-            "high":   [float(v or 0) for v in highs],
-            "low":    [float(v or 0) for v in lows],
-            "close":  [float(v or 0) for v in closes],
-            "volume": [float(v or 0) for v in volumes],
-        })
 
         print(f"   Got {len(df)} rows ({df['date'].min()} → {df['date'].max()})")
 
