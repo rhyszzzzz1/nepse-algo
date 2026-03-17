@@ -53,12 +53,20 @@ def rows_to_list(cursor_rows):
 
 def detect_db_backend(conn):
     """Best-effort backend detection for health diagnostics."""
-    # Turso wrapper from src.data.db_factory
-    if hasattr(conn, "raw_conn"):
-        return "turso"
     # Standard local sqlite3 connection
     if isinstance(conn, sqlite3.Connection):
         return "sqlite"
+
+    # Turso wrappers from src.data.db_factory (old + new paths)
+    if hasattr(conn, "raw_conn") or hasattr(conn, "client"):
+        return "turso"
+
+    t = type(conn)
+    module_name = getattr(t, "__module__", "").lower()
+    class_name = getattr(t, "__name__", "").lower()
+    if "libsql" in module_name or "libsql" in class_name or "clientconnection" in class_name:
+        return "turso"
+
     return "unknown"
 
 
