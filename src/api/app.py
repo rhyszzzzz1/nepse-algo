@@ -337,27 +337,13 @@ def get_stock(symbol):
     conn = get_db()
     try:
         symbol = symbol.upper()
-        days_param = request.args.get("days")
-
-        if days_param is None:
-            prices = rows_to_list(conn.execute("""
-                SELECT date, open, high, low, close, volume,
-                       price_change_pct, volume_ratio, atr14, market_condition
-                FROM   clean_price_history
-                WHERE  symbol = ?
-                ORDER  BY date DESC
-            """, (symbol,)).fetchall())
-        else:
-            days = int(days_param)
-            if days <= 0:
-                return jsonify({"error": "days must be a positive integer"}), 400
-            prices = rows_to_list(conn.execute("""
-                SELECT date, open, high, low, close, volume,
-                       price_change_pct, volume_ratio, atr14, market_condition
-                FROM   clean_price_history
-                WHERE  symbol = ?
-                ORDER  BY date DESC LIMIT ?
-            """, (symbol, days)).fetchall())
+        prices = rows_to_list(conn.execute("""
+            SELECT date, open, high, low, close, volume,
+                   price_change_pct, volume_ratio, atr14, market_condition
+            FROM   clean_price_history
+            WHERE  symbol = ?
+            ORDER  BY date DESC
+        """, (symbol,)).fetchall())
         prices.reverse()
 
         latest_signal = conn.execute("""
@@ -388,24 +374,12 @@ def get_ohlcv(symbol):
     conn = get_db()
     try:
         symbol = symbol.upper()
-        days_param = request.args.get("days")
-        if days_param is None:
-            rows = conn.execute("""
-                SELECT date, open, high, low, close, volume
-                FROM   clean_price_history
-                WHERE  symbol = ?
-                ORDER  BY date DESC
-            """, (symbol,)).fetchall()
-        else:
-            days = int(days_param)
-            if days <= 0:
-                return jsonify({"error": "days must be a positive integer"}), 400
-            rows = conn.execute("""
-                SELECT date, open, high, low, close, volume
-                FROM   clean_price_history
-                WHERE  symbol = ?
-                ORDER  BY date DESC LIMIT ?
-            """, (symbol, days)).fetchall()
+        rows = conn.execute("""
+            SELECT date, open, high, low, close, volume
+            FROM   clean_price_history
+            WHERE  symbol = ?
+            ORDER  BY date DESC
+        """, (symbol,)).fetchall()
         rows = list(reversed(rows))
 
         return jsonify({
@@ -429,25 +403,12 @@ def get_price(symbol):
     conn = get_db()
     try:
         symbol = symbol.upper()
-        days_param = request.args.get("days")
-
-        if days_param is None:
-            rows = conn.execute("""
-                SELECT date, open, high, low, close, volume, market_condition
-                FROM   clean_price_history
-                WHERE  symbol = ?
-                ORDER  BY date DESC
-            """, (symbol,)).fetchall()
-        else:
-            days = int(days_param)
-            if days <= 0:
-                return jsonify({"error": "days must be a positive integer"}), 400
-            rows = conn.execute("""
-                SELECT date, open, high, low, close, volume, market_condition
-                FROM   clean_price_history
-                WHERE  symbol = ?
-                ORDER  BY date DESC LIMIT ?
-            """, (symbol, days)).fetchall()
+        rows = conn.execute("""
+            SELECT date, open, high, low, close, volume, market_condition
+            FROM   clean_price_history
+            WHERE  symbol = ?
+            ORDER  BY date DESC
+        """, (symbol,)).fetchall()
 
         if not rows:
             return jsonify({"error": f"Symbol '{symbol}' not found"}), 404
