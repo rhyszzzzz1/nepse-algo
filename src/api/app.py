@@ -338,10 +338,20 @@ def get_stock(symbol):
     try:
         symbol = symbol.upper()
         prices = rows_to_list(conn.execute("""
-            SELECT date, open, high, low, close, volume,
-                   price_change_pct, volume_ratio, atr14, market_condition
-            FROM   clean_price_history
-            WHERE  symbol = ?
+             SELECT p.date,
+                 p.open,
+                 p.high,
+                 p.low,
+                 p.close,
+                 p.volume,
+                 c.price_change_pct,
+                 c.volume_ratio,
+                 c.atr14,
+                 c.market_condition
+             FROM   price_history p
+             LEFT JOIN clean_price_history c
+                 ON c.symbol = p.symbol AND c.date = p.date
+             WHERE  p.symbol = ?
             ORDER  BY date DESC
         """, (symbol,)).fetchall())
         prices.reverse()
@@ -376,7 +386,7 @@ def get_ohlcv(symbol):
         symbol = symbol.upper()
         rows = conn.execute("""
             SELECT date, open, high, low, close, volume
-            FROM   clean_price_history
+            FROM   price_history
             WHERE  symbol = ?
             ORDER  BY date DESC
         """, (symbol,)).fetchall()
@@ -404,10 +414,18 @@ def get_price(symbol):
     try:
         symbol = symbol.upper()
         rows = conn.execute("""
-            SELECT date, open, high, low, close, volume, market_condition
-            FROM   clean_price_history
-            WHERE  symbol = ?
-            ORDER  BY date DESC
+             SELECT p.date,
+                 p.open,
+                 p.high,
+                 p.low,
+                 p.close,
+                 p.volume,
+                 c.market_condition
+             FROM   price_history p
+             LEFT JOIN clean_price_history c
+                 ON c.symbol = p.symbol AND c.date = p.date
+             WHERE  p.symbol = ?
+             ORDER  BY p.date DESC
         """, (symbol,)).fetchall()
 
         if not rows:
