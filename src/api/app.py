@@ -51,6 +51,17 @@ def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
 
 
+def detect_db_backend(conn):
+    """Best-effort backend detection for health diagnostics."""
+    # Turso wrapper from src.data.db_factory
+    if hasattr(conn, "raw_conn"):
+        return "turso"
+    # Standard local sqlite3 connection
+    if isinstance(conn, sqlite3.Connection):
+        return "sqlite"
+    return "unknown"
+
+
 def floor_sheet_table_exists(conn):
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='floor_sheet'"
@@ -102,6 +113,7 @@ def index():
 def health():
     try:
         conn = get_db()
+        backend = detect_db_backend(conn)
         try:
             price_rows = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
             clean_rows = conn.execute("SELECT COUNT(*) FROM clean_price_history").fetchone()[0]
@@ -112,9 +124,15 @@ def health():
             conn.close()
 
         env_vars = {k: v for k, v in os.environ.items() if "VOL" in k.upper() or "RAILWAY" in k.upper()}
+        turso_url_present = bool(os.environ.get("TURSO_DATABASE_URL"))
+        turso_token_present = bool(os.environ.get("TURSO_AUTH_TOKEN"))
         return jsonify({
             "status": "ok",
             "db_path": DB_PATH,
+            "db_source": backend,
+            "turso_config_present": turso_url_present and turso_token_present,
+            "turso_url_present": turso_url_present,
+            "turso_token_present": turso_token_present,
             "time": datetime.now().isoformat(),
             "env": env_vars,
             "db": {"companies": companies, "price_rows": price_rows, "clean_rows": clean_rows},
