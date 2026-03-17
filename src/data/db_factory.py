@@ -167,7 +167,104 @@ def get_db_connection(db_path=None, timeout=60.0):
             return conn
             
         except ImportError:
-            logger.warning("libsql driver not installed. Falling back to local sqlite.")
+            try:
+                import libsql_client
+
+                class DictRow:
+                    def __init__(self, cursor, row):
+                        self._row = row
+                        self._description = cursor.description
+                        if self._description:
+                            self._keys = [col[0].lower() for col in self._description]
+                            self._orig_keys = [col[0] for col in self._description]
+                        else:
+                            self._keys = []
+                            self._orig_keys = []
+
+                    def keys(self):
+                        return self._orig_keys
+
+                    def __getitem__(self, item):
+                        if isinstance(item, int):
+                            return self._row[item]
+                        if isinstance(item, str):
+                            try:
+                                idx = self._keys.index(item.lower())
+                                return self._row[idx]
+                            except ValueError:
+                                raise KeyError(item)
+                        raise TypeError("Index must be int or string")
+
+                    def __iter__(self):
+                        return iter(self._row)
+
+                    def __len__(self):
+                        return len(self._row)
+
+                class ResultCursor:
+                    def __init__(self, result_set, row_factory=None):
+                        self._rows = list(result_set.rows or [])
+                        self._index = 0
+                        self._row_factory = row_factory
+                        self.description = [(c,) for c in (result_set.columns or [])]
+
+                    def _convert(self, row):
+                        if self._row_factory:
+                            return self._row_factory(self, row)
+                        return row
+
+                    def fetchone(self):
+                        if self._index >= len(self._rows):
+                            return None
+                        row = self._rows[self._index]
+                        self._index += 1
+                        return self._convert(row)
+
+                    def fetchall(self):
+                        if self._index >= len(self._rows):
+                            return []
+                        out = [self._convert(r) for r in self._rows[self._index:]]
+                        self._index = len(self._rows)
+                        return out
+
+                class ClientConnection:
+                    def __init__(self, client, row_factory=None):
+                        self.client = client
+                        self.row_factory = row_factory
+
+                    def execute(self, sql, parameters=()):
+                        stmt = (sql, list(parameters)) if parameters else sql
+                        rs = self.client.execute(stmt)
+                        return ResultCursor(rs, self.row_factory)
+
+                    def executemany(self, sql, seq_of_parameters):
+                        # Keep semantics simple for API reads/writes.
+                        last = None
+                        for params in seq_of_parameters:
+                            last = self.execute(sql, params)
+                        return last
+
+                    def commit(self):
+                        return None
+
+                    def rollback(self):
+                        return None
+
+                    def close(self):
+                        self.client.close()
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc_val, exc_tb):
+                        self.close()
+
+                client_url = url.replace("libsql://", "https://")
+                client = libsql_client.create_client_sync(client_url, auth_token=token)
+                return ClientConnection(client, row_factory=DictRow)
+
+            except ImportError:
+                logger.warning("libsql driver not installed. Falling back to local sqlite.")
         except Exception as e:
             logger.error(f"Failed to connect to Turso at {url}: {e}")
             # Fallback will continue below
