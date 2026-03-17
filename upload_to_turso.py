@@ -18,8 +18,8 @@ Usage:
   python upload_to_turso.py
 """
 
-import os, sqlite3, sys, time
-import libsql
+import math, os, sqlite3, sys, time
+import libsql_client
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,7 +31,7 @@ TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 # Tables to SKIP uploading (too large / only needed for local pipeline)
 SKIP_TABLES = {"floor_sheet", "sqlite_sequence"}
 
-BATCH_SIZE = 500   # rows per INSERT batch
+BATCH_SIZE = 300   # rows per INSERT batch
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -51,12 +51,72 @@ def get_indexes(conn, table):
         (table,)
     ).fetchall()
 
+# ── Turso client helpers ─────────────────────────────────────────────────────
+
+def _sanitize_value(v):
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, bool):
+        return 1 if v else 0
+    return v
+
+
+class TursoConn:
+    """libsql sync client wrapper used by this uploader."""
+    def __init__(self, url, token):
+        # libsql_client supports http/https/ws/wss. Convert libsql:// accordingly.
+        client_url = url.replace("libsql://", "https://")
+        self.client = libsql_client.create_client_sync(client_url, auth_token=token)
+
+    def execute(self, sql, params=None):
+        if params:
+            self.client.execute((sql, list(params)))
+        else:
+            self.client.execute(sql)
+
+    def insert_many(self, table, col_list, rows):
+        # Build one INSERT statement with multiple VALUES tuples to reduce round trips.
+        row_placeholders = "(" + ", ".join(["?"] * len(col_list)) + ")"
+        values_sql = ", ".join([row_placeholders] * len(rows))
+        cols_sql = ", ".join([f'"{c}"' for c in col_list])
+        sql = f'INSERT OR IGNORE INTO "{table}" ({cols_sql}) VALUES {values_sql}'
+
+        flat_params = []
+        for row in rows:
+            flat_params.extend(_sanitize_value(v) for v in row)
+
+        self.execute(sql, flat_params)
+
+    def commit(self):
+        pass  # autocommit mode
+
+    def close(self):
+        self.client.close()
+
+
 def drop_table_turso(tconn, table):
     try:
         tconn.execute(f'DROP TABLE IF EXISTS "{table}"')
-        tconn.commit()
     except Exception as e:
         print(f"  [warn] drop {table}: {e}")
+
+def insert_rows(tconn, table, col_list, rows):
+    if not rows:
+        return 0
+
+    try:
+        tconn.insert_many(table, col_list, rows)
+        tconn.commit()
+        return len(rows)
+    except Exception as e:
+        if len(rows) == 1:
+            print(f"  [warn] skipping 1 row in {table}: {e}")
+            return 0
+
+        mid = len(rows) // 2
+        left = insert_rows(tconn, table, col_list, rows[:mid])
+        right = insert_rows(tconn, table, col_list, rows[mid:])
+        return left + right
 
 def upload_table(src_conn, tconn, table):
     create_sql = get_create_sql(src_conn, table)
@@ -81,10 +141,6 @@ def upload_table(src_conn, tconn, table):
 
     # Fetch column names
     cols = [r[1] for r in src_conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
-    placeholders = ", ".join(["?" for _ in cols])
-    col_list = ", ".join([f'"{c}"' for c in cols])
-    insert_sql = f'INSERT OR IGNORE INTO "{table}" ({col_list}) VALUES ({placeholders})'
-
     inserted = 0
     batch = []
     cur = src_conn.execute(f'SELECT * FROM "{table}"')
@@ -95,21 +151,7 @@ def upload_table(src_conn, tconn, table):
         if not rows:
             break
         batch = [tuple(r) for r in rows]
-        try:
-            tconn.executemany(insert_sql, batch)
-            tconn.commit()
-        except Exception as e:
-            print(f"  [error] inserting into {table}: {e}")
-            # Try row by row
-            for row in batch:
-                try:
-                    tconn.execute(insert_sql, row)
-                    tconn.commit()
-                    inserted += 1
-                except Exception as e2:
-                    pass  # skip bad rows silently
-            continue
-        inserted += len(batch)
+        inserted += insert_rows(tconn, table, cols, batch)
         elapsed = time.time() - t0
         pct = inserted / total * 100
         rate = inserted / elapsed if elapsed > 0 else 0
@@ -139,7 +181,7 @@ def main():
     src = sqlite3.connect(LOCAL_DB)
 
     print(f"Connecting to Turso:    {URL}\n")
-    tconn = libsql.connect(URL, auth_token=TOKEN)
+    tconn = TursoConn(URL, TOKEN)
 
     tables = get_tables(src)
     todo   = [t for t in tables if t not in SKIP_TABLES]
