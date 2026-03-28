@@ -27,12 +27,12 @@ except ImportError:
         from src.data.active_symbols import load_active_symbols
 
 try:
-    from floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
+    from floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price, normalize_trade_date, recompute_broker_summary_for_symbol_dates
 except ImportError:
     try:
-        from data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
+        from data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price, normalize_trade_date, recompute_broker_summary_for_symbol_dates
     except ImportError:
-        from src.data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price
+        from src.data.floorsheet_pipeline import get_db, ensure_schema, compute_broker_summary, compute_daily_price, normalize_trade_date, recompute_broker_summary_for_symbol_dates
 
 try:
     from fetcher import create_tables as create_market_tables, fetch_price_history
@@ -400,6 +400,7 @@ class MerolaganiScraper:
         self.client = MerolaganiClient()
         self.storage = storage
         self.output_dir = storage.output_dir
+        self.failed_dates = {}  # Track symbol -> list of (date, error) tuples
 
     def get_company_page(self, symbol: str) -> Tuple[str, BeautifulSoup]:
         url = f"{BASE_MEROLAGANI}/CompanyDetail.aspx?symbol={symbol}"
@@ -745,107 +746,125 @@ class MerolaganiScraper:
         return all_pages[all_pages.get("page_number", 1) == page_number].copy()
 
     def fetch_all_floorsheet_pages(self, symbol: str, market_date_filter: str) -> pd.DataFrame:
-        try:
-            _, soup = self.get_company_page(symbol)
-            state = self.extract_hidden_fields(soup)
+        # Retry configuration for transient network errors (DNS, connection timeout)
+        max_retries = int(os.getenv("MERO_MAX_RETRIES", "3"))
+        retry_delay = 1.0  # Start with 1 second, will double on each retry
+        
+        for attempt in range(max_retries):
+            try:
+                _, soup = self.get_company_page(symbol)
+                state = self.extract_hidden_fields(soup)
 
-            # 1) Open Floorsheet tab
-            self._postback_company_detail_with_state(
-                symbol,
-                state,
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab",
-                "#divFloorsheet",
-                {
-                    "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab",
-                    "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab": "",
-                },
-            )
-
-            common = {
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtFloorsheetDateFilter": market_date_filter,
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtBuyerFilter": "",
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$txtSellerFilter": "",
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnPCID": "PC1",
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnPCID": "PC2",
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnCurrentPage": "0",
-            }
-
-            # 2) Search by date (page 1)
-            search_text = self._postback_company_detail_with_state(
-                symbol,
-                state,
-                "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
-                "#divFloorsheet",
-                {
-                    **common,
-                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": "0",
-                    "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
-                },
-            )
-
-            frames: List[pd.DataFrame] = []
-            page1 = self._parse_floorsheet_response(symbol, search_text)
-            if page1.empty:
-                return pd.DataFrame()
-            page1["page_number"] = 1
-            frames.append(page1)
-
-            total_pages = self._extract_total_pages(search_text)
-            max_pages = MAX_FLOORSHEET_PAGES_OVERRIDE or total_pages or 250
-            if total_pages:
-                max_pages = min(max_pages, total_pages)
-
-            # 3) Page through all available pages for the selected date.
-            seen_signatures = {
-                tuple(page1[["date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]].head(5).astype(str).itertuples(index=False, name=None))
-            }
-            empty_or_repeat_streak = 0
-
-            # Merolagani floorsheet pager uses page index 0 for the initial
-            # search page; subsequent pages are addressed with indices 2..N.
-            for page_index in range(2, max_pages + 1):
-                page_text = self._postback_company_detail_with_state(
+                # 1) Open Floorsheet tab
+                self._postback_company_detail_with_state(
                     symbol,
                     state,
-                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab",
                     "#divFloorsheet",
                     {
-                        **common,
-                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": str(page_index),
-                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging": "",
-                        "__EVENTTARGET": "",
-                        "__EVENTARGUMENT": "",
+                        "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab",
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$btnFloorsheetTab": "",
                     },
                 )
 
-                df = self._parse_floorsheet_response(symbol, page_text)
-                if df.empty:
-                    empty_or_repeat_streak += 1
-                    if total_pages or empty_or_repeat_streak >= 2:
-                        break
-                    continue
+                common = {
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$txtFloorsheetDateFilter": market_date_filter,
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$txtBuyerFilter": "",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$txtSellerFilter": "",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnPCID": "PC1",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnPCID": "PC2",
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet2$hdnCurrentPage": "0",
+                }
 
-                signature = tuple(df[["date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]].head(5).astype(str).itertuples(index=False, name=None))
-                if signature in seen_signatures:
-                    empty_or_repeat_streak += 1
-                    if total_pages or empty_or_repeat_streak >= 2:
-                        break
-                    continue
+                # 2) Search by date (page 1)
+                search_text = self._postback_company_detail_with_state(
+                    symbol,
+                    state,
+                    "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
+                    "#divFloorsheet",
+                    {
+                        **common,
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": "0",
+                        "__EVENTTARGET": "ctl00$ContentPlaceHolder1$CompanyDetail1$lbtnSearchFloorsheet",
+                    },
+                )
 
-                seen_signatures.add(signature)
+                frames: List[pd.DataFrame] = []
+                page1 = self._parse_floorsheet_response(symbol, search_text)
+                if page1.empty:
+                    return pd.DataFrame()
+                page1["page_number"] = 1
+                frames.append(page1)
+
+                total_pages = self._extract_total_pages(search_text)
+                max_pages = MAX_FLOORSHEET_PAGES_OVERRIDE or total_pages or 250
+                if total_pages:
+                    max_pages = min(max_pages, total_pages)
+
+                # 3) Page through all available pages for the selected date.
+                seen_signatures = {
+                    tuple(page1[["date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]].head(5).astype(str).itertuples(index=False, name=None))
+                }
                 empty_or_repeat_streak = 0
-                df["page_number"] = page_index
-                frames.append(df)
 
-            if not frames:
+                # Merolagani floorsheet pager uses page index 0 for the initial
+                # search page; subsequent pages are addressed with indices 2..N.
+                for page_index in range(2, max_pages + 1):
+                    page_text = self._postback_company_detail_with_state(
+                        symbol,
+                        state,
+                        "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging",
+                        "#divFloorsheet",
+                        {
+                            **common,
+                            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$hdnCurrentPage": str(page_index),
+                            "ctl00$ContentPlaceHolder1$CompanyDetail1$PagerControlFloorsheet1$btnPaging": "",
+                            "__EVENTTARGET": "",
+                            "__EVENTARGUMENT": "",
+                        },
+                    )
+
+                    df = self._parse_floorsheet_response(symbol, page_text)
+                    if df.empty:
+                        empty_or_repeat_streak += 1
+                        if total_pages or empty_or_repeat_streak >= 2:
+                            break
+                        continue
+
+                    signature = tuple(df[["date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]].head(5).astype(str).itertuples(index=False, name=None))
+                    if signature in seen_signatures:
+                        empty_or_repeat_streak += 1
+                        if total_pages or empty_or_repeat_streak >= 2:
+                            break
+                        continue
+
+                    seen_signatures.add(signature)
+                    empty_or_repeat_streak = 0
+                    df["page_number"] = page_index
+                    frames.append(df)
+
+                if not frames:
+                    return pd.DataFrame()
+
+                return pd.concat(frames, ignore_index=True).drop_duplicates(
+                    subset=["symbol", "date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]
+                )
+            except Exception as e:
+                error_str = str(e).lower()
+                is_transient = any(x in error_str for x in ["nameresolutionerror", "connectionerror", "errno 11001", "failed to resolve", "max retries"])
+                
+                if is_transient and attempt < max_retries - 1:
+                    logger.warning(f"Floorsheet transient error for {symbol} @ {market_date_filter} (attempt {attempt + 1}/{max_retries}): {type(e).__name__}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                
+                # Permanent failure or max retries exceeded
+                logger.warning(f"Floorsheet failed {symbol} @ {market_date_filter}: {e}")
+                if symbol not in self.failed_dates:
+                    self.failed_dates[symbol] = []
+                self.failed_dates[symbol].append((market_date_filter, str(e)[:100]))
                 return pd.DataFrame()
-
-            return pd.concat(frames, ignore_index=True).drop_duplicates(
-                subset=["symbol", "date", "transaction_no", "buyer_broker", "seller_broker", "quantity", "rate", "amount"]
-            )
-        except Exception as e:
-            logger.warning(f"Floorsheet failed {symbol} @ {market_date_filter}: {e}")
-            return pd.DataFrame()
 
 
 def get_all_active_symbols():
@@ -873,6 +892,8 @@ def parse_cli_args():
     parser.add_argument("--floor-end", default=FLOOR_END_DATE, help="Floorsheet end date in YYYY-MM-DD format")
     parser.add_argument("--limit-symbols", type=int, default=LIMIT_SYMBOLS, help="Limit the number of symbols processed")
     parser.add_argument("--resume-after-symbol", default=None, help="Only process symbols after this symbol (exclusive), e.g. SCB")
+    parser.add_argument("--symbols", default=None, help="Comma-separated list of specific symbols to process, e.g. NABIL,NMB")
+    parser.add_argument("--broker-only", action="store_true", help="Fetch only floorsheet/broker data; skip OHLCV, about, news, and dividend tabs")
     parser.add_argument("--skip-ohlcv", action="store_true", help="Skip OHLCV fetching")
     parser.add_argument("--skip-floorsheet", action="store_true", help="Skip floorsheet fetching")
     return parser.parse_args()
@@ -920,11 +941,19 @@ def run_pipeline(args=None):
             logger.warning("No symbols found in db. Falling back to active text.")
             all_symbols = extract_symbols_from_text(ACTIVE_SYMBOLS_TEXT)
 
-        # 1. ALWAYS persist the FULL instrument mapping to SQLite
-        instruments_df = pd.DataFrame([{"symbol": s, "label": s, "source": "nepse.db"} for s in all_symbols])
-        storage.save_df_to_sqlite(instruments_df, "instruments", if_exists="replace", add_fetched_at=False)
-        storage.save_df_to_sqlite(instruments_df, "companies", if_exists="replace", add_fetched_at=False)
-        logger.info(f"Saved {len(all_symbols)} instruments to company index")
+        # 1. Persist full instrument mapping only for broad runs.
+        # Sharded runs (broker-only/symbol-filtered) execute many concurrent
+        # processes; replacing these global tables in each process can race.
+        should_refresh_company_index = not (
+            args.broker_only or args.symbols or args.resume_after_symbol or args.limit_symbols
+        )
+        if should_refresh_company_index:
+            instruments_df = pd.DataFrame([{"symbol": s, "label": s, "source": "nepse.db"} for s in all_symbols])
+            storage.save_df_to_sqlite(instruments_df, "instruments", if_exists="replace", add_fetched_at=False)
+            storage.save_df_to_sqlite(instruments_df, "companies", if_exists="replace", add_fetched_at=False)
+            logger.info(f"Saved {len(all_symbols)} instruments to company index")
+        else:
+            logger.info("Skipping company index refresh for filtered/broker-only run")
 
         process_symbols = all_symbols
         if args.resume_after_symbol:
@@ -932,13 +961,18 @@ def run_pipeline(args=None):
             process_symbols = [s for s in process_symbols if str(s).upper() > marker]
             logger.info("Resume filter active: processing symbols after %s (%d symbols)", marker, len(process_symbols))
 
+        if args.symbols:
+            only = {s.strip().upper() for s in args.symbols.split(",")}
+            process_symbols = [s for s in process_symbols if str(s).upper() in only]
+            logger.info("Symbol filter active: processing %s (%d symbols)", sorted(only), len(process_symbols))
+
         if args.limit_symbols:
             process_symbols = process_symbols[:args.limit_symbols]
 
         logger.info(f"Processing details for {len(process_symbols)} symbols...")
 
         for symbol in process_symbols:
-            if not args.skip_ohlcv:
+            if not args.skip_ohlcv and not args.broker_only:
                 try:
                     ohlcv_df = fetch_price_history(
                         symbol,
@@ -951,35 +985,38 @@ def run_pipeline(args=None):
                     logger.error(f"OHLCV failed for {symbol}: {e}")
 
             # 2. ABOUT INFO (cleans up junk as per request logic)
-            try:
-                about_df = scraper.fetch_about_company(symbol)
-                if not about_df.empty:
-                    # about_company has symbol as primary key; reruns should
-                    # update existing rows, not fail on duplicate inserts.
-                    storage.conn.execute("DELETE FROM about_company WHERE symbol = ?", (symbol,))
-                    storage.conn.commit()
-                    storage.save_df_to_sqlite(about_df, "about_company", if_exists="append")
-                    logger.info(f"Saved about info for {symbol}")
-            except Exception as e:
-                logger.error(f"About failed for {symbol}: {e}")
+            if not args.broker_only:
+                try:
+                    about_df = scraper.fetch_about_company(symbol)
+                    if not about_df.empty:
+                        # about_company has symbol as primary key; reruns should
+                        # update existing rows, not fail on duplicate inserts.
+                        storage.conn.execute("DELETE FROM about_company WHERE symbol = ?", (symbol,))
+                        storage.conn.commit()
+                        storage.save_df_to_sqlite(about_df, "about_company", if_exists="append")
+                        logger.info(f"Saved about info for {symbol}")
+                except Exception as e:
+                    logger.error(f"About failed for {symbol}: {e}")
             
             # 3. NEWS 
-            try:
-                news_df = scraper.fetch_all_news(symbol)
-                if not news_df.empty:
-                    storage.save_df_to_sqlite(news_df, "news", if_exists="append")
-                    logger.info(f"Saved {len(news_df)} news for {symbol}")
-            except Exception as e:
-                logger.error(f"News failed for {symbol}: {e}")
+            if not args.broker_only:
+                try:
+                    news_df = scraper.fetch_all_news(symbol)
+                    if not news_df.empty:
+                        storage.save_df_to_sqlite(news_df, "news", if_exists="append")
+                        logger.info(f"Saved {len(news_df)} news for {symbol}")
+                except Exception as e:
+                    logger.error(f"News failed for {symbol}: {e}")
 
             # 4. DIVIDEND
-            try:
-                div_df = scraper.fetch_all_dividend(symbol)
-                if not div_df.empty:
-                    storage.save_df_to_sqlite(div_df, "dividend", if_exists="append")
-                    logger.info(f"Saved {len(div_df)} dividend for {symbol}")
-            except Exception as e:
-                logger.error(f"Dividend failed for {symbol}: {e}")
+            if not args.broker_only:
+                try:
+                    div_df = scraper.fetch_all_dividend(symbol)
+                    if not div_df.empty:
+                        storage.save_df_to_sqlite(div_df, "dividend", if_exists="append")
+                        logger.info(f"Saved {len(div_df)} dividend for {symbol}")
+                except Exception as e:
+                    logger.error(f"Dividend failed for {symbol}: {e}")
                 
             # 5. FLOORSHEET
             if not args.skip_floorsheet:
@@ -990,16 +1027,46 @@ def run_pipeline(args=None):
                         dt_str = to_mmddyyyy(dt)
                         df_floor = scraper.fetch_all_floorsheet_pages(symbol, dt_str)
                         if not df_floor.empty:
+                            df_floor = df_floor.copy()
+                            df_floor["date"] = df_floor["date"].apply(normalize_trade_date)
+                            unique_dates = sorted({d for d in df_floor["date"].dropna().tolist() if d})
+                            for trade_date in unique_dates:
+                                storage.conn.execute(
+                                    "DELETE FROM floor_sheet WHERE symbol = ? AND date = ?",
+                                    (symbol, trade_date),
+                                )
+                            storage.conn.commit()
                             storage.save_df_to_sqlite(df_floor, "floor_sheet", if_exists="append")
-                            logger.info(f"Saved {len(df_floor)} floorsheet rows for {symbol} on {dt_str}")
+                            recompute_broker_summary_for_symbol_dates(symbol, unique_dates)
+                            logger.info(f"Saved {len(df_floor)} floorsheet rows for {symbol} on {dt_str} -> {', '.join(unique_dates)}")
                 except Exception as e:
                     logger.error(f"Floorsheet failed for {symbol}: {e}")
 
         # Post-process the databases
         storage.create_indexes()
         # Compute central accumulation summaries right after updating table
-        compute_broker_summary()
+        if not args.broker_only:
+            compute_broker_summary()
         compute_daily_price()
+        
+        # Report skipped/failed dates
+        if scraper.failed_dates:
+            logger.warning("\n" + "="*80)
+            logger.warning("INCOMPLETE DATA WARNING: The following dates failed to fetch (skipped):")
+            logger.warning("="*80)
+            total_failed = 0
+            for symbol in sorted(scraper.failed_dates.keys()):
+                failed_list = scraper.failed_dates[symbol]
+                total_failed += len(failed_list)
+                logger.warning(f"  {symbol}: {len(failed_list)} date(s) failed")
+                for date_str, error in failed_list[:5]:  # Show first 5 failures per symbol
+                    logger.warning(f"    - {date_str}: {error}")
+                if len(failed_list) > 5:
+                    logger.warning(f"    ... and {len(failed_list) - 5} more")
+            logger.warning("="*80)
+            logger.warning(f"TOTAL: {total_failed} date(s) across {len(scraper.failed_dates)} symbol(s) failed to fetch.")
+            logger.warning("These dates were SKIPPED. Re-run the pipeline to retry these symbols.")
+            logger.warning("="*80 + "\n")
         
         logger.info("Pipeline Complete.")
 

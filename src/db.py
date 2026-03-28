@@ -10,7 +10,13 @@ if "RAILWAY_VOLUME_MOUNT_PATH" in os.environ:
 else:
     DB_PATH = os.path.join(ROOT, "data", "nepse.db")
 
-from src.data.db_factory import get_db_connection
+try:
+    from src.data.db_factory import get_db_connection
+except ImportError:
+    try:
+        from data.db_factory import get_db_connection
+    except ImportError:
+        from db_factory import get_db_connection
 
 def get_db():
     return get_db_connection(DB_PATH)

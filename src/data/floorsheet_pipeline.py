@@ -100,6 +100,19 @@ def ensure_schema():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bs_sym_broker ON broker_summary(symbol, broker)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bs_date_sym   ON broker_summary(date, symbol)")
 
+    # Dates confirmed as non-trading/no-data during market-wide backfills.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backfill_skip_dates (
+            date            TEXT PRIMARY KEY,
+            reason          TEXT,
+            source          TEXT,
+            attempts        INTEGER DEFAULT 0,
+            first_marked_at TEXT,
+            last_marked_at  TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_skip_date ON backfill_skip_dates(date)")
+
     # ── Daily Price OHLCV ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_price (
@@ -134,6 +147,20 @@ def _is_nepse_holiday(dt):
     """NEPSE trades Sun–Thu. Fri (4) and Sat (5) are holidays."""
     return dt.weekday() in (4, 5)
 
+def normalize_trade_date(value):
+    """Normalize various scraped date formats to YYYY-MM-DD."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return text.replace("/", "-")
+
 def _dates_already_in_db():
     """Return dates that have already been processed.
     Checks both floor_sheet (raw) and broker_summary (aggregated+pruned) so
@@ -148,6 +175,38 @@ def _dates_already_in_db():
         agg_dates = set()
     conn.close()
     return raw_dates | agg_dates
+
+def _get_backfill_skip_dates():
+    """Dates marked as known non-trading/no-data from prior runs."""
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT date FROM backfill_skip_dates").fetchall()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+    finally:
+        conn.close()
+
+def _mark_backfill_skip_date(date_str_ymd, reason, source="merolagani"):
+    """Persist a date that repeatedly returns no floor-sheet data."""
+    ts = datetime.now().isoformat()
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO backfill_skip_dates(date, reason, source, attempts, first_marked_at, last_marked_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                reason = excluded.reason,
+                source = excluded.source,
+                attempts = backfill_skip_dates.attempts + 1,
+                last_marked_at = excluded.last_marked_at
+            """,
+            (date_str_ymd, reason, source, ts, ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 def _save_rows(rows):
     """Bulk-insert floor_sheet rows. Returns count inserted."""
@@ -170,6 +229,78 @@ def _save_rows(rows):
     n = len(rows)
     conn.close()
     return n
+
+
+def recompute_broker_summary_for_symbol_dates(symbol, dates):
+    """Rebuild broker_summary for a single symbol across specific dates."""
+    if not symbol or not dates:
+        return 0
+
+    normalized_dates = sorted({normalize_trade_date(date) for date in dates if normalize_trade_date(date)})
+    if not normalized_dates:
+        return 0
+
+    conn = get_db()
+    fetched_at = datetime.now().isoformat()
+    total_rows = 0
+    try:
+        for trade_date in normalized_dates:
+            conn.execute(
+                "DELETE FROM broker_summary WHERE symbol=? AND date=?",
+                (symbol, trade_date),
+            )
+
+            conn.execute("""
+                INSERT INTO broker_summary
+                    (date, symbol, broker, buy_qty, buy_amount, trades_as_buyer,
+                     sell_qty, sell_amount, trades_as_seller, net_qty, net_amount, fetched_at)
+                SELECT
+                    date, symbol, buyer_broker,
+                    SUM(quantity), SUM(amount), COUNT(*),
+                    0.0, 0.0, 0,
+                    SUM(quantity), SUM(amount),
+                    ?
+                FROM floor_sheet
+                WHERE symbol=? AND date=?
+                GROUP BY date, symbol, buyer_broker
+                ON CONFLICT(date, symbol, broker) DO UPDATE SET
+                    buy_qty         = excluded.buy_qty,
+                    buy_amount      = excluded.buy_amount,
+                    trades_as_buyer = excluded.trades_as_buyer,
+                    net_qty         = excluded.buy_qty - broker_summary.sell_qty,
+                    net_amount      = excluded.buy_amount - broker_summary.sell_amount
+            """, (fetched_at, symbol, trade_date))
+
+            conn.execute("""
+                INSERT INTO broker_summary
+                    (date, symbol, broker, sell_qty, sell_amount, trades_as_seller,
+                     buy_qty, buy_amount, trades_as_buyer, net_qty, net_amount, fetched_at)
+                SELECT
+                    date, symbol, seller_broker,
+                    SUM(quantity), SUM(amount), COUNT(*),
+                    0.0, 0.0, 0,
+                    -SUM(quantity), -SUM(amount),
+                    ?
+                FROM floor_sheet
+                WHERE symbol=? AND date=?
+                GROUP BY date, symbol, seller_broker
+                ON CONFLICT(date, symbol, broker) DO UPDATE SET
+                    sell_qty          = excluded.sell_qty,
+                    sell_amount       = excluded.sell_amount,
+                    trades_as_seller  = excluded.trades_as_seller,
+                    net_qty           = broker_summary.buy_qty - excluded.sell_qty,
+                    net_amount        = broker_summary.buy_amount - excluded.sell_amount
+            """, (fetched_at, symbol, trade_date))
+
+            total_rows += conn.execute(
+                "SELECT COUNT(*) FROM broker_summary WHERE symbol=? AND date=?",
+                (symbol, trade_date),
+            ).fetchone()[0]
+
+        conn.commit()
+        return total_rows
+    finally:
+        conn.close()
 
 
 # ── PRUNING HELPERS ───────────────────────────────────────────────────────────
@@ -407,6 +538,41 @@ def _ml_fetch_with_playwright(date_str_ymd, ml_date):
             page_obj.wait_for_timeout(250)
         return ""
 
+    def _goto_page(page_obj, page_no):
+        # Try the website helper first; if missing, use pager link click fallback.
+        try:
+            used_helper = page_obj.evaluate(
+                """(p) => {
+                    if (typeof changePageIndex === 'function') {
+                        changePageIndex(String(p),
+                          'ctl00_ContentPlaceHolder1_PagerControl1_hdnCurrentPage',
+                          'ctl00_ContentPlaceHolder1_PagerControl1_btnPaging');
+                        return true;
+                    }
+                    return false;
+                }""",
+                page_no,
+            )
+        except Exception:
+            used_helper = False
+
+        if not used_helper:
+            try:
+                link = page_obj.locator(f"a:has-text('{page_no}')").first
+                if link.count() == 0:
+                    return False
+                link.click(timeout=15000)
+            except Exception:
+                return False
+
+        for _ in range(20):
+            try:
+                page_obj.wait_for_selector("table.table", timeout=1000)
+                return True
+            except Exception:
+                page_obj.wait_for_timeout(250)
+        return False
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -424,25 +590,24 @@ def _ml_fetch_with_playwright(date_str_ymd, ml_date):
                 browser.close()
                 return [], 0
 
-            table_html1 = _safe_table_html(page)
-            page_rows, total_pages = _ml_parse_table(table_html1)
+            # Parse from full page HTML so pager text ("Total pages") is visible.
+            page_rows, total_pages = _ml_parse_table(soup1)
             if not page_rows:
                 browser.close()
                 return [], 0
 
             all_rows.extend(page_rows)
 
-            # Full-page pagination via page JS function used by the website
+            # Full-page pagination (helper function when available, pager link otherwise)
             for page_no in range(2, total_pages + 1):
-                page.evaluate(
-                    f'changePageIndex("{page_no}","ctl00_ContentPlaceHolder1_PagerControl1_hdnCurrentPage","ctl00_ContentPlaceHolder1_PagerControl1_btnPaging")'
-                )
-                page.wait_for_load_state("load", timeout=60000)
-                page.wait_for_selector("table.table", timeout=60000)
+                if not _goto_page(page, page_no):
+                    print(f"  [{date_str_ymd}] Playwright fallback could not move to page {page_no}; keeping fetched rows")
+                    break
+
                 page.wait_for_timeout(700)
 
-                table_htmln = _safe_table_html(page)
-                rowsn, _ = _ml_parse_table(table_htmln)
+                htmln = _safe_page_content(page)
+                rowsn, _ = _ml_parse_table(htmln)
                 if not rowsn:
                     break
                 all_rows.extend(rowsn)
@@ -454,7 +619,7 @@ def _ml_fetch_with_playwright(date_str_ymd, ml_date):
 
     return all_rows, total_pages
 
-def fetch_historical_via_merolagani(date_str_ymd):
+def fetch_historical_via_merolagani(date_str_ymd, return_status=False):
     """
     Fetch full market floor sheet for one date from merolagani.com/Floorsheet.aspx
     date_str_ymd: YYYY-MM-DD
@@ -463,6 +628,11 @@ def fetch_historical_via_merolagani(date_str_ymd):
     dt = datetime.strptime(date_str_ymd, "%Y-%m-%d")
     ml_date    = dt.strftime("%m/%d/%Y")  # MM/DD/YYYY
     fetched_at = datetime.now().isoformat()
+
+    def _ret(saved, status, reason=""):
+        if return_status:
+            return saved, status, reason
+        return saved
 
     try:
         # ── Step 1: GET the page to collect form state ────────────────────────
@@ -532,7 +702,7 @@ def fetch_historical_via_merolagani(date_str_ymd):
                 all_rows, total_pages = _ml_fetch_with_playwright(date_str_ymd, ml_date)
                 if not all_rows:
                     print(f"  [{date_str_ymd}] Playwright fallback found no data")
-                    return 0
+                    return _ret(0, "no_data", "playwright_fallback_no_data")
 
                 db_rows = [
                     (date_str_ymd, row["symbol"], row["buyer_broker"], row["seller_broker"],
@@ -541,7 +711,7 @@ def fetch_historical_via_merolagani(date_str_ymd):
                 ]
                 saved = _save_rows(db_rows)
                 print(f"  [{date_str_ymd}] [Playwright] {total_pages}p | {len(all_rows)} trades | {saved} saved")
-                return saved
+                return _ret(saved, "saved", "playwright_success")
             break
 
         soup1 = BeautifulSoup(r1.text, "html.parser")
@@ -550,13 +720,13 @@ def fetch_historical_via_merolagani(date_str_ymd):
         page_text = soup1.get_text()
         if "Could not find floorsheet" in page_text or "No record" in page_text:
             print(f"  [{date_str_ymd}] No data (holiday or data not available)")
-            return 0
+            return _ret(0, "no_data", "no_record_message")
 
         page_rows, total_pages = _ml_parse_table(soup1)
 
         if not page_rows:
             print(f"  [{date_str_ymd}] No table rows found in response")
-            return 0
+            return _ret(0, "no_data", "empty_table")
 
         all_rows = list(page_rows)
         first_row = page_rows[0].copy()
@@ -632,12 +802,12 @@ def fetch_historical_via_merolagani(date_str_ymd):
         ]
         saved = _save_rows(db_rows)
         print(f"  [{date_str_ymd}] {total_pages}p | {len(all_rows)} trades | {saved} saved")
-        return saved
+        return _ret(saved, "saved", "merolagani_success")
 
     except Exception as e:
         print(f"  [{date_str_ymd}] ERROR: {e}")
         traceback.print_exc()
-        return 0
+        return _ret(0, "error", str(e))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -813,7 +983,7 @@ def run_daily_update(prune_raw=True):
     else:
         saved = fetch_today_via_api()
         if not saved:
-            print(f"[Daily] API returned no data — falling back to Merolagani scrape...")
+            print("[Daily] API returned no data; falling back to Merolagani scrape...")
             saved = fetch_historical_via_merolagani(today)
         if not saved:
             print(f"[Daily] No floor sheet data available for {today}")
@@ -841,6 +1011,7 @@ def run_historical_backfill(days_back=None, start_date=None, prune_raw=False):
     """
     ensure_schema()
     existing = _dates_already_in_db()
+    skipped_dates = _get_backfill_skip_dates()
 
     today = datetime.now().date()
     if start_date:
@@ -855,11 +1026,17 @@ def run_historical_backfill(days_back=None, start_date=None, prune_raw=False):
     d = start
     while d <= today:
         d_str = d.strftime("%Y-%m-%d")
-        if not _is_nepse_holiday(datetime.combine(d, datetime.min.time())) and d_str not in existing:
+        if (
+            not _is_nepse_holiday(datetime.combine(d, datetime.min.time()))
+            and d_str not in existing
+            and d_str not in skipped_dates
+        ):
             dates_to_fetch.append(d_str)
         d += timedelta(days=1)
 
     print(f"[Backfill] {len(dates_to_fetch)} dates to fetch ({start} → {today})")
+    if skipped_dates:
+        print(f"[Backfill] Skipping {len(skipped_dates)} previously marked no-data dates")
     if prune_raw:
         print(f"[Backfill] prune_raw=True — raw floor_sheet rows will be deleted after each batch")
 
@@ -867,7 +1044,10 @@ def run_historical_backfill(days_back=None, start_date=None, prune_raw=False):
     batch = 0
     batch_dates = []
     for i, date_str in enumerate(dates_to_fetch):
-        saved = fetch_historical_via_merolagani(date_str)
+        saved, status, reason = fetch_historical_via_merolagani(date_str, return_status=True)
+        if status == "no_data":
+            _mark_backfill_skip_date(date_str, reason)
+            print(f"  [{date_str}] Marked as no-data for future runs ({reason})")
         total += saved
         batch += 1
         batch_dates.append(date_str)
