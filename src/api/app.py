@@ -6,6 +6,8 @@ import sys
 os.environ["DATABASE_URL"] = ""
 os.environ.pop("DATABASE_URL", None)
 os.environ.pop("POSTGRES_URL", None)
+os.environ.pop("TURSO_DATABASE_URL", None)
+os.environ.pop("TURSO_AUTH_TOKEN", None)
 
 # Fix import paths for Railway
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,9 +16,24 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import sqlite3
 import re
+import json
 from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from src.integrations.meroshare import (
+    MeroShareClient,
+    MeroShareClientError,
+    MeroShareSessionExpired,
+    connect_meroshare_account,
+    ensure_meroshare_tables,
+    get_meroshare_account,
+    get_meroshare_holdings,
+    get_meroshare_purchase_history,
+    get_meroshare_transactions,
+    import_meroshare_holdings_to_portfolio,
+    list_meroshare_accounts,
+    sync_meroshare_account,
+)
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
@@ -39,16 +56,552 @@ if "RAILWAY_VOLUME_MOUNT_PATH" in os.environ:
 else:
     DB_PATH = os.path.join(ROOT, "data", "nepse.db")
 
-from src.data.db_factory import get_db_connection
-
 def get_db():
-    return get_db_connection(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+with get_db() as _bootstrap_conn:
+    ensure_meroshare_tables(_bootstrap_conn)
 
 # -- ADMIN KEY (Change this if you want) --
 SCRAPE_KEY = "antigravity_trigger_2026"
 
 def rows_to_list(cursor_rows):
     return [dict(r) for r in cursor_rows]
+
+
+def table_exists(conn, table_name):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def get_table_max_date(conn, table_name):
+    if not table_exists(conn, table_name):
+        return None
+    row = conn.execute(f"SELECT MAX(date) FROM {table_name}").fetchone()
+    return row[0] if row and row[0] else None
+
+
+def get_data_freshness(conn):
+    return {
+        "price_history": get_table_max_date(conn, "price_history"),
+        "floor_sheet": get_table_max_date(conn, "floor_sheet"),
+        "broker_summary": get_table_max_date(conn, "broker_summary"),
+        "daily_price": get_table_max_date(conn, "daily_price"),
+        "market_summary": get_table_max_date(conn, "market_summary"),
+    }
+
+
+def clamp_probability(value):
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if val > 1:
+        val = val / 100.0
+    return max(0.0, min(1.0, val))
+
+
+def confidence_band(probability):
+    if probability >= 0.75:
+        return "high"
+    if probability >= 0.6:
+        return "medium"
+    return "low"
+
+
+def heuristic_prediction_label(signal_text, total_score):
+    signal = (signal_text or "").upper()
+    score = float(total_score or 0)
+    if signal == "BUY" or score >= 70:
+        return "BUY"
+    if signal == "HOLD" and score < 45:
+        return "HOLD"
+    if score >= 50:
+        return "WATCH"
+    return "IGNORE"
+
+
+def build_prediction_drivers(row):
+    candidates = [
+        ("broker_accumulation", row.get("broker_accumulation"), "positive"),
+        ("liquidity_spike", row.get("liquidity_spike"), "positive"),
+        ("pump_score", row.get("pump_score"), "positive"),
+        ("total_score", row.get("total_score"), "positive"),
+        ("volume_score", row.get("volume_score"), "positive"),
+        ("rsi_score", row.get("rsi_score"), "positive"),
+        ("broker_distribution", row.get("broker_distribution"), "negative"),
+    ]
+    normalized = []
+    for feature, value, direction in candidates:
+        try:
+            impact = float(value)
+        except (TypeError, ValueError):
+            continue
+        if impact == 0:
+            continue
+        normalized.append({
+            "feature": feature,
+            "impact": round(impact, 4),
+            "direction": direction,
+        })
+    normalized.sort(key=lambda item: abs(item["impact"]), reverse=True)
+    return normalized[:4]
+
+
+def fetch_heuristic_prediction_rows(conn, symbol=None, batch_date=None, limit=25):
+    latest_signals_date = get_table_max_date(conn, "signals")
+    target_date = batch_date or latest_signals_date
+    if not target_date or not table_exists(conn, "signals"):
+        return []
+
+    query = """
+        SELECT
+            s.symbol,
+            s.date,
+            s.close,
+            s.total_score,
+            s.signal,
+            s.market_condition,
+            s.volume_score,
+            s.rsi_score,
+            ns.pump_score,
+            ns.liquidity_spike,
+            ns.broker_accumulation,
+            ns.broker_distribution,
+            ns.net_broker_flow,
+            ns.volatility_regime,
+            dp.volume
+        FROM signals s
+        LEFT JOIN nepse_signals ns
+            ON ns.symbol = s.symbol AND ns.date = s.date
+        LEFT JOIN daily_price dp
+            ON dp.symbol = s.symbol AND dp.date = s.date
+        WHERE s.date = ?
+    """
+    params = [target_date]
+
+    if symbol:
+        query += " AND s.symbol = ?"
+        params.append(symbol.upper())
+
+    query += " ORDER BY s.total_score DESC, s.symbol ASC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(int(limit))
+
+    return rows_to_list(conn.execute(query, params).fetchall())
+
+
+def serialize_heuristic_prediction(row):
+    probability = clamp_probability(row.get("total_score"))
+    return {
+        "symbol": row.get("symbol"),
+        "company_name": row.get("symbol"),
+        "prediction": heuristic_prediction_label(row.get("signal"), row.get("total_score")),
+        "probability": round(probability, 4),
+        "confidence_band": confidence_band(probability),
+        "threshold": 0.6,
+        "expected_horizon_days": 7,
+        "top_drivers": build_prediction_drivers(row),
+        "snapshot": {
+            "close": row.get("close"),
+            "volume": row.get("volume"),
+            "sector": None,
+            "market_condition": row.get("market_condition"),
+        },
+    }
+
+
+def latest_model_registry_row(conn):
+    if not table_exists(conn, "ml_model_registry"):
+        return None
+    row = conn.execute(
+        """
+        SELECT *
+        FROM ml_model_registry
+        ORDER BY created_at DESC, model_key DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return row_to_dict(row)
+
+
+def latest_ml_prediction_batch_date(conn, model_key=None):
+    if not table_exists(conn, "ml_predictions_daily"):
+        return None
+    if model_key:
+        row = conn.execute(
+            "SELECT MAX(batch_date) AS batch_date FROM ml_predictions_daily WHERE model_key = ?",
+            (model_key,),
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT MAX(batch_date) AS batch_date FROM ml_predictions_daily").fetchone()
+    return row["batch_date"] if row and row["batch_date"] else None
+
+
+def parse_json_field(value, fallback):
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def serialize_model_prediction(row):
+    snapshot = parse_json_field(row.get("snapshot_json"), {})
+    feature_snapshot = parse_json_field(row.get("features_json"), {})
+    top_drivers = parse_json_field(row.get("top_drivers_json"), [])
+    return {
+        "symbol": row.get("symbol"),
+        "company_name": row.get("company_name") or row.get("symbol"),
+        "prediction": row.get("prediction"),
+        "probability": round(float(row.get("probability") or 0), 6),
+        "confidence_band": row.get("confidence_band"),
+        "threshold": float(row.get("threshold") or 0),
+        "expected_horizon_days": int(row.get("expected_horizon_days") or 5),
+        "rank": int(row.get("rank") or 0),
+        "top_drivers": top_drivers,
+        "snapshot": snapshot,
+        "features": feature_snapshot,
+        "model_key": row.get("model_key"),
+        "target": row.get("target"),
+        "validation_metrics": {
+            "precision": float(row.get("validation_precision") or 0),
+            "recall": float(row.get("validation_recall") or 0),
+            "accuracy": float(row.get("validation_accuracy") or 0),
+        } if row.get("target") else None,
+    }
+
+
+def fetch_model_prediction_rows(conn, symbol=None, batch_date=None, model_key=None, signal=None, limit=25):
+    if not table_exists(conn, "ml_predictions_daily"):
+        return []
+    resolved_model_key = model_key
+    if not resolved_model_key:
+        latest_model = latest_model_registry_row(conn)
+        resolved_model_key = latest_model["model_key"] if latest_model else None
+    target_date = batch_date or latest_ml_prediction_batch_date(conn, resolved_model_key)
+    if not target_date:
+        return []
+
+    query = """
+        SELECT
+            mpd.*,
+            mr.target,
+            mr.validation_precision,
+            mr.validation_recall,
+            mr.validation_accuracy,
+            COALESCE(ac.company_name, mpd.symbol) AS company_name
+        FROM ml_predictions_daily mpd
+        LEFT JOIN ml_model_registry mr
+          ON mr.model_key = mpd.model_key
+        LEFT JOIN about_company ac
+          ON ac.symbol = mpd.symbol
+        WHERE mpd.batch_date = ?
+    """
+    params = [target_date]
+    if resolved_model_key:
+        query += " AND mpd.model_key = ?"
+        params.append(resolved_model_key)
+    if symbol:
+        query += " AND mpd.symbol = ?"
+        params.append(symbol.upper())
+    if signal:
+        query += " AND UPPER(mpd.prediction) = ?"
+        params.append(signal.upper())
+    query += " ORDER BY mpd.rank ASC, mpd.probability DESC, mpd.symbol ASC LIMIT ?"
+    params.append(int(limit))
+    return rows_to_list(conn.execute(query, params).fetchall())
+
+
+def compute_broker_edge_windows(conn, threshold=0.6):
+    windows = []
+    window_specs = [(3, 5), (5, 7), (10, 10)]
+    if not table_exists(conn, "broker_summary") or not table_exists(conn, "daily_price"):
+        return windows
+
+    for lookback_days, forward_days in window_specs:
+        row = conn.execute(
+            """
+            WITH broker_day AS (
+                SELECT
+                    symbol,
+                    date,
+                    AVG(CASE WHEN net_qty > 0 THEN 1.0 ELSE 0.0 END) AS accumulation_ratio
+                FROM broker_summary
+                GROUP BY symbol, date
+            ),
+            aligned AS (
+                SELECT
+                    dp.symbol,
+                    dp.date,
+                    dp.close,
+                    AVG(bd.accumulation_ratio) OVER (
+                        PARTITION BY dp.symbol
+                        ORDER BY dp.date
+                        ROWS BETWEEN ? PRECEDING AND CURRENT ROW
+                    ) AS lookback_accumulation,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY dp.symbol
+                        ORDER BY dp.date
+                    ) AS row_num,
+                    LEAD(dp.close, ?) OVER (
+                        PARTITION BY dp.symbol
+                        ORDER BY dp.date
+                    ) AS future_close
+                FROM daily_price dp
+                JOIN broker_day bd
+                    ON bd.symbol = dp.symbol AND bd.date = dp.date
+            ),
+            samples AS (
+                SELECT
+                    symbol,
+                    date,
+                    lookback_accumulation,
+                    ((future_close - close) / NULLIF(close, 0)) * 100.0 AS forward_return
+                FROM aligned
+                WHERE row_num >= ? AND future_close IS NOT NULL
+            )
+            SELECT
+                COUNT(*) AS sample_count,
+                AVG(CASE WHEN forward_return > 0 THEN 1.0 ELSE 0.0 END) AS positive_rate,
+                AVG(forward_return) AS avg_forward_return,
+                AVG(forward_return) FILTER (WHERE forward_return IS NOT NULL) AS median_proxy
+            FROM samples
+            WHERE lookback_accumulation >= ?
+            """,
+            (lookback_days - 1, forward_days, lookback_days, threshold),
+        ).fetchone()
+
+        sample_count = int(row["sample_count"] or 0)
+        windows.append({
+            "lookback_days": lookback_days,
+            "forward_days": forward_days,
+            "threshold": threshold,
+            "sample_count": sample_count,
+            "positive_rate": round(float(row["positive_rate"] or 0), 4) if sample_count else 0.0,
+            "avg_forward_return": round(float(row["avg_forward_return"] or 0), 4) if sample_count else 0.0,
+            "median_forward_return": round(float(row["median_proxy"] or 0), 4) if sample_count else 0.0,
+        })
+
+    return windows
+
+
+DERIVED_SCANNERS = {
+    "broker_activity",
+    "accumulation",
+    "broker_smartflow",
+    "best_volume_transaction",
+    "best_gainer_loser",
+    "smc_scan",
+    "support_resistance",
+    "best_of_best",
+}
+
+MARKET_BREADTH_CATEGORIES = {
+    "advanced",
+    "declined",
+    "unchanged",
+    "positive-circuit",
+    "negative-circuit",
+}
+
+
+def get_latest_snapshot_date(conn, table_name, requested_date=None):
+    if requested_date:
+        return requested_date
+    return get_table_max_date(conn, table_name)
+
+
+def row_to_dict(row):
+    return dict(row) if row else None
+
+
+def sanitize_meroshare_account(account):
+    if not account:
+        return None
+    hidden_keys = {
+        "auth_token",
+        "raw_profile_json",
+    }
+    sanitized = {k: v for k, v in account.items() if k not in hidden_keys}
+    linked = sanitized.get("linked_accounts")
+    if isinstance(linked, list):
+        sanitized["linked_accounts"] = [
+            {k: v for k, v in item.items() if k not in {"raw_json"}}
+            for item in linked
+        ]
+    return sanitized
+
+
+def build_market_breadth_dataset(conn, latest_daily_date, previous_daily_date):
+    if not latest_daily_date or not previous_daily_date:
+        return []
+    query = """
+        WITH latest_market AS (
+            SELECT symbol, open, high, low, close, volume
+            FROM price_history
+            WHERE date = ?
+        ),
+        previous_market AS (
+            SELECT symbol, close AS previous_close
+            FROM price_history
+            WHERE date = ?
+        ),
+        latest_activity AS (
+            SELECT symbol, open, high, low, volume, amount, trades
+            FROM daily_price
+            WHERE date = ?
+        ),
+        last_trade AS (
+            SELECT symbol, quantity AS ltv
+            FROM (
+                SELECT
+                    symbol,
+                    quantity,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY page_no DESC, row_no_in_page DESC, id DESC
+                    ) AS rn
+                FROM floor_sheet
+                WHERE date = ?
+            ) ranked
+            WHERE rn = 1
+        )
+        SELECT
+            lm.symbol,
+            COALESCE(ac.company_name, lm.symbol) AS company_name,
+            ac.sector,
+            ROUND(lm.close, 4) AS ltp,
+            ROUND(lm.close - pm.previous_close, 4) AS change,
+            ROUND(((lm.close - pm.previous_close) / NULLIF(pm.previous_close, 0)) * 100.0, 4) AS change_percent,
+            ROUND(COALESCE(la.open, lm.open), 4) AS open,
+            ROUND(COALESCE(la.high, lm.high), 4) AS high,
+            ROUND(COALESCE(la.low, lm.low), 4) AS low,
+            ROUND(COALESCE(la.volume, lm.volume), 4) AS volume,
+            ROUND(COALESCE(la.amount, 0), 4) AS turnover,
+            ROUND(COALESCE(lt.ltv, 0), 4) AS ltv,
+            ROUND(pm.previous_close, 4) AS previous_close
+        FROM latest_market lm
+        JOIN previous_market pm
+          ON pm.symbol = lm.symbol
+        LEFT JOIN latest_activity la
+          ON la.symbol = lm.symbol
+        LEFT JOIN last_trade lt
+          ON lt.symbol = lm.symbol
+        LEFT JOIN about_company ac
+          ON ac.symbol = lm.symbol
+    """
+    return rows_to_list(
+        conn.execute(
+            query,
+            (latest_daily_date, previous_daily_date, latest_daily_date, latest_daily_date),
+        ).fetchall()
+    )
+
+
+def fetch_latest_scanner_rows(conn, scanner_name, batch_date=None, limit=200, sector=None, signal=None):
+    if scanner_name not in DERIVED_SCANNERS:
+        return []
+    target_date = get_latest_snapshot_date(conn, "scanner_results_daily", batch_date)
+    if not target_date:
+        return []
+    where = ["date = ?", "scanner_name = ?"]
+    params = [target_date, scanner_name]
+    if sector:
+        where.append("sector = ?")
+        params.append(sector)
+    if signal:
+        where.append("UPPER(COALESCE(signal, '')) = ?")
+        params.append(signal.upper())
+    query = f"""
+        SELECT *
+        FROM scanner_results_daily
+        WHERE {' AND '.join(where)}
+        ORDER BY rank ASC, score DESC, symbol ASC
+        LIMIT ?
+    """
+    params.append(limit)
+    return rows_to_list(conn.execute(query, params).fetchall())
+
+
+def compute_portfolio_health(conn, portfolio_id):
+    positions = rows_to_list(
+        conn.execute(
+            """
+            SELECT
+                pp.portfolio_id,
+                pp.symbol,
+                pp.qty,
+                pp.avg_cost,
+                pp.opened_at,
+                pp.notes,
+                sfs.close,
+                sfs.change_pct,
+                sfs.composite_score,
+                sfs.risk_score,
+                sfs.signal_label,
+                sfs.sector
+            FROM portfolio_positions pp
+            LEFT JOIN stock_factor_snapshot sfs
+              ON sfs.symbol = pp.symbol
+             AND sfs.date = (SELECT MAX(date) FROM stock_factor_snapshot)
+            WHERE pp.portfolio_id = ?
+            ORDER BY pp.symbol
+            """,
+            (portfolio_id,),
+        ).fetchall()
+    )
+    enriched = []
+    total_cost = 0.0
+    total_value = 0.0
+    composite_weight = 0.0
+    risk_weight = 0.0
+    for row in positions:
+        qty = float(row.get("qty") or 0)
+        avg_cost = float(row.get("avg_cost") or 0)
+        close = float(row.get("close") or 0)
+        cost = qty * avg_cost
+        value = qty * close
+        pnl = value - cost
+        pnl_pct = (pnl / cost * 100.0) if cost else 0.0
+        total_cost += cost
+        total_value += value
+        composite_weight += float(row.get("composite_score") or 0) * value
+        risk_weight += float(row.get("risk_score") or 0) * value
+        row.update(
+            {
+                "market_value": round(value, 4),
+                "cost_basis": round(cost, 4),
+                "pnl": round(pnl, 4),
+                "pnl_pct": round(pnl_pct, 4),
+            }
+        )
+        enriched.append(row)
+
+    total_pnl = total_value - total_cost
+    avg_composite = (composite_weight / total_value) if total_value else 0.0
+    avg_risk = (risk_weight / total_value) if total_value else 0.0
+    return {
+        "portfolio_id": portfolio_id,
+        "positions": enriched,
+        "summary": {
+            "total_cost": round(total_cost, 4),
+            "market_value": round(total_value, 4),
+            "total_pnl": round(total_pnl, 4),
+            "total_pnl_pct": round((total_pnl / total_cost * 100.0), 4) if total_cost else 0.0,
+            "avg_composite_score": round(avg_composite, 4),
+            "avg_risk_score": round(avg_risk, 4),
+            "position_count": len(enriched),
+        },
+    }
 
 
 def detect_db_backend(conn):
@@ -88,6 +641,46 @@ def parse_pagination(default_limit=5000, max_limit=20000):
     limit = min(limit, max_limit)
     offset = (page - 1) * limit
     return page, limit, offset
+
+
+def resolve_date_window(conn, table_name, symbol=None, days=30):
+    start_date = request.args.get("startDate", "").strip()
+    end_date = request.args.get("endDate", "").strip()
+
+    where = []
+    params = []
+    if symbol:
+        where.append("symbol = ?")
+        params.append(symbol)
+
+    if start_date and end_date:
+        where.append("date BETWEEN ? AND ?")
+        params.extend([start_date, end_date])
+        return start_date, end_date, where, params
+
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    cutoff = conn.execute(
+        f"""
+        SELECT date
+        FROM (
+            SELECT DISTINCT date
+            FROM {table_name}
+            {where_clause}
+            ORDER BY date DESC
+            LIMIT ?
+        )
+        ORDER BY date ASC
+        LIMIT 1
+        """,
+        [*params, days],
+    ).fetchone()
+    if not cutoff:
+        return None, None, where, params
+
+    since = cutoff[0]
+    latest_query = f"SELECT MAX(date) FROM {table_name} {where_clause}"
+    latest = conn.execute(latest_query, params).fetchone()[0]
+    return since, latest, where, params
 
 
 def discover_endpoints():
@@ -243,16 +836,196 @@ def trigger_scrape():
 def market_overview():
     conn = get_db()
     try:
-        summary = conn.execute(
+        latest_daily_date = get_table_max_date(conn, "daily_price")
+        latest_market_summary = conn.execute(
             "SELECT * FROM market_summary ORDER BY date DESC LIMIT 1"
         ).fetchone()
+        previous_daily_date = None
+        if latest_daily_date:
+            previous_daily_date = conn.execute(
+                "SELECT MAX(date) FROM daily_price WHERE date < ?",
+                (latest_daily_date,),
+            ).fetchone()[0]
+
+        market_totals = {}
+        breadth = {
+            "advanced": 0,
+            "declined": 0,
+            "unchanged": 0,
+            "positive_circuit": 0,
+            "negative_circuit": 0,
+            "compared_symbols": 0,
+        }
+        top_gainers = []
+        top_losers = []
+        top_turnover = []
+        top_traded = []
+        top_transactions = []
+        sector_leaders = []
+
+        if latest_daily_date and previous_daily_date:
+            market_totals_row = conn.execute(
+                """
+                SELECT
+                    ? AS date,
+                    SUM(amount) AS total_turnover,
+                    SUM(volume) AS total_volume,
+                    SUM(trades) AS total_transactions,
+                    COUNT(*) AS total_scrips_traded
+                FROM daily_price
+                WHERE date = ?
+                """,
+                (latest_daily_date, latest_daily_date),
+            ).fetchone()
+            market_totals = dict(market_totals_row) if market_totals_row else {}
+
+            breadth_row = conn.execute(
+                """
+                WITH latest AS (
+                    SELECT symbol, close, high, low
+                    FROM price_history
+                    WHERE date = ?
+                ),
+                previous AS (
+                    SELECT symbol, close
+                    FROM price_history
+                    WHERE date = ?
+                )
+                SELECT
+                    COUNT(*) AS compared_symbols,
+                    SUM(CASE WHEN latest.close > previous.close THEN 1 ELSE 0 END) AS advanced,
+                    SUM(CASE WHEN latest.close < previous.close THEN 1 ELSE 0 END) AS declined,
+                    SUM(CASE WHEN latest.close = previous.close THEN 1 ELSE 0 END) AS unchanged,
+                    SUM(
+                        CASE
+                            WHEN previous.close IS NOT NULL
+                             AND previous.close <> 0
+                             AND ((latest.close - previous.close) / previous.close) * 100.0 >= 9.95
+                             AND latest.close >= latest.high
+                            THEN 1 ELSE 0
+                        END
+                    ) AS positive_circuit,
+                    SUM(
+                        CASE
+                            WHEN previous.close IS NOT NULL
+                             AND previous.close <> 0
+                             AND ((latest.close - previous.close) / previous.close) * 100.0 <= -9.95
+                             AND latest.close <= latest.low
+                            THEN 1 ELSE 0
+                        END
+                    ) AS negative_circuit
+                FROM latest
+                JOIN previous ON previous.symbol = latest.symbol
+                """,
+                (latest_daily_date, previous_daily_date),
+            ).fetchone()
+            if breadth_row:
+                breadth = dict(breadth_row)
+
+            movers_query = """
+                WITH latest_market AS (
+                    SELECT symbol, close
+                    FROM price_history
+                    WHERE date = ?
+                ),
+                previous_market AS (
+                    SELECT symbol, close AS previous_close
+                    FROM price_history
+                    WHERE date = ?
+                ),
+                latest_activity AS (
+                    SELECT symbol, volume, amount, trades
+                    FROM daily_price
+                    WHERE date = ?
+                )
+                SELECT
+                    latest_market.symbol,
+                    latest_market.close,
+                    latest_activity.volume,
+                    latest_activity.amount,
+                    latest_activity.trades,
+                    previous_market.previous_close,
+                    ROUND(latest_market.close - previous_market.previous_close, 4) AS change,
+                    ROUND(((latest_market.close - previous_market.previous_close) / NULLIF(previous_market.previous_close, 0)) * 100.0, 4) AS change_percent,
+                    about_company.company_name,
+                    about_company.sector
+                FROM latest_market
+                JOIN previous_market ON previous_market.symbol = latest_market.symbol
+                LEFT JOIN latest_activity ON latest_activity.symbol = latest_market.symbol
+                LEFT JOIN about_company ON about_company.symbol = latest_market.symbol
+            """
+
+            top_gainers = rows_to_list(conn.execute(
+                movers_query + " ORDER BY change_percent DESC LIMIT 10",
+                (latest_daily_date, previous_daily_date, latest_daily_date)
+            ).fetchall())
+            top_losers = rows_to_list(conn.execute(
+                movers_query + " ORDER BY change_percent ASC LIMIT 10",
+                (latest_daily_date, previous_daily_date, latest_daily_date)
+            ).fetchall())
+            top_turnover = rows_to_list(conn.execute(
+                movers_query + " ORDER BY latest_activity.amount DESC LIMIT 10",
+                (latest_daily_date, previous_daily_date, latest_daily_date)
+            ).fetchall())
+            top_traded = rows_to_list(conn.execute(
+                movers_query + " ORDER BY latest_activity.volume DESC LIMIT 10",
+                (latest_daily_date, previous_daily_date, latest_daily_date)
+            ).fetchall())
+            top_transactions = rows_to_list(conn.execute(
+                movers_query + " ORDER BY latest_activity.trades DESC LIMIT 10",
+                (latest_daily_date, previous_daily_date, latest_daily_date)
+            ).fetchall())
+
+            sector_leaders = rows_to_list(conn.execute(
+                """
+                WITH latest AS (
+                    SELECT symbol, close, amount
+                    FROM daily_price
+                    WHERE date = ?
+                ),
+                previous AS (
+                    SELECT symbol, close AS previous_close
+                    FROM daily_price
+                    WHERE date = ?
+                )
+                SELECT
+                    about_company.sector,
+                    COUNT(*) AS scrip_count,
+                    SUM(latest.amount) AS turnover,
+                    ROUND(AVG(((latest.close - previous.previous_close) / NULLIF(previous.previous_close, 0)) * 100.0), 4) AS avg_change_percent
+                FROM latest
+                JOIN previous ON previous.symbol = latest.symbol
+                LEFT JOIN about_company ON about_company.symbol = latest.symbol
+                WHERE about_company.sector IS NOT NULL AND about_company.sector <> ''
+                GROUP BY about_company.sector
+                ORDER BY turnover DESC
+                LIMIT 12
+                """,
+                (latest_daily_date, previous_daily_date),
+            ).fetchall())
 
         latest_sector_date = conn.execute(
             "SELECT MAX(date) FROM sector_index"
         ).fetchone()[0]
+        previous_sector_date = conn.execute(
+            "SELECT MAX(date) FROM sector_index WHERE date < ?",
+            (latest_sector_date,),
+        ).fetchone()[0] if latest_sector_date else None
         sectors = rows_to_list(conn.execute(
-            "SELECT sector, value FROM sector_index WHERE date = ?",
-            (latest_sector_date,)
+            """
+            SELECT
+                current.sector,
+                current.value,
+                previous.value AS previous_value,
+                ROUND(current.value - COALESCE(previous.value, current.value), 4) AS point_change,
+                ROUND(((current.value - COALESCE(previous.value, current.value)) / NULLIF(previous.value, 0)) * 100.0, 4) AS change_percent
+            FROM sector_index current
+            LEFT JOIN sector_index previous
+                ON previous.sector = current.sector AND previous.date = ?
+            WHERE current.date = ?
+            ORDER BY current.sector ASC
+            """,
+            (previous_sector_date, latest_sector_date)
         ).fetchall()) if latest_sector_date else []
 
         sig_date = conn.execute(
@@ -260,15 +1033,101 @@ def market_overview():
         ).fetchone()[0]
         breakdown = rows_to_list(conn.execute("""
             SELECT signal, COUNT(*) AS count
-            FROM   signals WHERE date = ?
-            GROUP  BY signal
+            FROM signals
+            WHERE date = ?
+            GROUP BY signal
         """, (sig_date,)).fetchall()) if sig_date else []
 
         return jsonify({
-            "market_summary":   dict(summary) if summary else {},
-            "sector_indices":   sectors,
-            "signal_date":      sig_date,
+            "as_of": latest_daily_date,
+            "market_summary": dict(latest_market_summary) if latest_market_summary else {},
+            "derived_market_summary": market_totals,
+            "breadth": breadth,
+            "sector_indices": sectors,
+            "sector_overview": sector_leaders,
+            "sector_index_date": latest_sector_date,
+            "top_gainers": top_gainers,
+            "top_losers": top_losers,
+            "top_turnover": top_turnover,
+            "top_traded_shares": top_traded,
+            "top_transactions": top_transactions,
+            "signal_date": sig_date,
             "signal_breakdown": breakdown,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/market/breadth/<string:category>")
+def market_breadth_category(category):
+    conn = get_db()
+    try:
+        normalized = category.strip().lower()
+        if normalized not in MARKET_BREADTH_CATEGORIES:
+            return jsonify({
+                "error": f"Unknown breadth category '{category}'.",
+                "available": sorted(MARKET_BREADTH_CATEGORIES),
+            }), 404
+
+        latest_daily_date = get_table_max_date(conn, "daily_price")
+        previous_daily_date = None
+        if latest_daily_date:
+            previous_daily_date = conn.execute(
+                "SELECT MAX(date) FROM daily_price WHERE date < ?",
+                (latest_daily_date,),
+            ).fetchone()[0]
+
+        rows = build_market_breadth_dataset(conn, latest_daily_date, previous_daily_date)
+        def include_row(row):
+            change = float(row.get("change") or 0)
+            change_percent = float(row.get("change_percent") or 0)
+            ltp = float(row.get("ltp") or 0)
+            high = float(row.get("high") or 0)
+            low = float(row.get("low") or 0)
+            if normalized == "advanced":
+                return change > 0
+            if normalized == "declined":
+                return change < 0
+            if normalized == "unchanged":
+                return change == 0
+            if normalized == "positive-circuit":
+                return change_percent >= 9.95 and ltp >= high
+            if normalized == "negative-circuit":
+                return change_percent <= -9.95 and ltp <= low
+            return False
+
+        filtered = [row for row in rows if include_row(row)]
+
+        if normalized in {"declined", "negative-circuit"}:
+            filtered.sort(key=lambda item: (item.get("change_percent") or 0))
+        elif normalized == "unchanged":
+            filtered.sort(key=lambda item: (item.get("symbol") or ""))
+        else:
+            filtered.sort(key=lambda item: (item.get("change_percent") or 0), reverse=True)
+
+        return jsonify({
+            "category": normalized,
+            "as_of": latest_daily_date,
+            "previous_date": previous_daily_date,
+            "count": len(filtered),
+            "rows": filtered,
+            "columns": [
+                "symbol",
+                "company_name",
+                "sector",
+                "ltp",
+                "change",
+                "change_percent",
+                "open",
+                "high",
+                "low",
+                "volume",
+                "turnover",
+                "ltv",
+                "previous_close",
+            ],
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -339,11 +1198,11 @@ def get_stock(symbol):
         symbol = symbol.upper()
         prices = rows_to_list(conn.execute("""
              SELECT p.date,
-                 p.open,
-                 p.high,
-                 p.low,
-                 p.close,
-                 p.volume,
+                 COALESCE(c.open, NULLIF(p.open, 0), p.close) AS open,
+                 COALESCE(c.high, p.high) AS high,
+                 COALESCE(c.low, p.low) AS low,
+                 COALESCE(c.close, p.close) AS close,
+                 COALESCE(c.volume, p.volume) AS volume,
                  c.price_change_pct,
                  c.volume_ratio,
                  c.atr14,
@@ -352,7 +1211,7 @@ def get_stock(symbol):
              LEFT JOIN clean_price_history c
                  ON c.symbol = p.symbol AND c.date = p.date
              WHERE  p.symbol = ?
-            ORDER  BY date DESC
+            ORDER  BY p.date DESC
         """, (symbol,)).fetchall())
         prices.reverse()
 
@@ -385,10 +1244,17 @@ def get_ohlcv(symbol):
     try:
         symbol = symbol.upper()
         rows = conn.execute("""
-            SELECT date, open, high, low, close, volume
-            FROM   price_history
-            WHERE  symbol = ?
-            ORDER  BY date DESC
+            SELECT p.date,
+                   COALESCE(c.open, NULLIF(p.open, 0), p.close) AS open,
+                   COALESCE(c.high, p.high) AS high,
+                   COALESCE(c.low, p.low) AS low,
+                   COALESCE(c.close, p.close) AS close,
+                   COALESCE(c.volume, p.volume) AS volume
+            FROM   price_history p
+            LEFT JOIN clean_price_history c
+                   ON c.symbol = p.symbol AND c.date = p.date
+            WHERE  p.symbol = ?
+            ORDER  BY p.date DESC
         """, (symbol,)).fetchall()
         rows = list(reversed(rows))
 
@@ -415,11 +1281,11 @@ def get_price(symbol):
         symbol = symbol.upper()
         rows = conn.execute("""
              SELECT p.date,
-                 p.open,
-                 p.high,
-                 p.low,
-                 p.close,
-                 p.volume,
+                 COALESCE(c.open, NULLIF(p.open, 0), p.close) AS open,
+                 COALESCE(c.high, p.high) AS high,
+                 COALESCE(c.low, p.low) AS low,
+                 COALESCE(c.close, p.close) AS close,
+                 COALESCE(c.volume, p.volume) AS volume,
                  c.market_condition
              FROM   price_history p
              LEFT JOIN clean_price_history c
@@ -969,40 +1835,75 @@ def floorsheet_symbol(symbol):
         if not floor_sheet_table_exists(conn):
             return jsonify({"error": "floor_sheet table not found"}), 404
 
-        cutoff = conn.execute(
-            "SELECT date FROM (SELECT DISTINCT date FROM floor_sheet WHERE symbol=? ORDER BY date DESC LIMIT ?) ORDER BY date ASC LIMIT 1",
-            (sym, days)
-        ).fetchone()
-        if not cutoff:
+        since, latest_date, _, _ = resolve_date_window(conn, "floor_sheet", symbol=sym, days=days)
+        if not since:
             return jsonify({"error": f"No floorsheet data for '{sym}'"}), 404
 
-        since = cutoff[0]
-        latest_date = conn.execute(
-            "SELECT MAX(date) FROM floor_sheet WHERE symbol=?", (sym,)
-        ).fetchone()[0]
+        end_date = request.args.get("endDate", "").strip() or latest_date
         total_count = conn.execute(
-            "SELECT COUNT(*) FROM floor_sheet WHERE symbol=? AND date>=?",
-            (sym, since)
+            "SELECT COUNT(*) FROM floor_sheet WHERE symbol=? AND date BETWEEN ? AND ?",
+            (sym, since, end_date)
         ).fetchone()[0]
         dates_count = conn.execute(
-            "SELECT COUNT(DISTINCT date) FROM floor_sheet WHERE symbol=? AND date>=?",
-            (sym, since)
+            "SELECT COUNT(DISTINCT date) FROM floor_sheet WHERE symbol=? AND date BETWEEN ? AND ?",
+            (sym, since, end_date)
         ).fetchone()[0]
 
         trades = rows_to_list(conn.execute("""
             SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
             FROM floor_sheet
-            WHERE symbol=? AND date>=?
+            WHERE symbol=? AND date BETWEEN ? AND ?
             ORDER BY date DESC, id DESC
             LIMIT ? OFFSET ?
-        """, (sym, since, limit, offset)).fetchall())
+        """, (sym, since, end_date, limit, offset)).fetchall())
 
         return jsonify({
             "symbol": sym,
             "days": days,
             "since": since,
+            "end_date": end_date,
             "latest_date": latest_date,
             "dates_count": dates_count,
+            "page": page,
+            "limit": limit,
+            "count": len(trades),
+            "total_count": total_count,
+            "has_more": offset + len(trades) < total_count,
+            "trades": trades,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/floorsheet/<symbol>/<date_str>")
+def floorsheet_symbol_by_date(symbol, date_str):
+    sym = symbol.upper()
+    page, limit, offset = parse_pagination(default_limit=2000, max_limit=50000)
+    conn = get_db()
+    try:
+        if not floor_sheet_table_exists(conn):
+            return jsonify({"error": "floor_sheet table not found"}), 404
+
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM floor_sheet WHERE symbol=? AND date=?",
+            (sym, date_str)
+        ).fetchone()[0]
+        if total_count == 0:
+            return jsonify({"error": f"No floorsheet data for '{sym}' on '{date_str}'"}), 404
+
+        trades = rows_to_list(conn.execute("""
+            SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
+            FROM floor_sheet
+            WHERE symbol=? AND date=?
+            ORDER BY id ASC
+            LIMIT ? OFFSET ?
+        """, (sym, date_str, limit, offset)).fetchall())
+
+        return jsonify({
+            "symbol": sym,
+            "date": date_str,
             "page": page,
             "limit": limit,
             "count": len(trades),
@@ -1108,51 +2009,121 @@ def broker_summary_route(symbol):
     sym    = symbol.upper()
     conn   = get_db()
     try:
-        cutoff = conn.execute(
-            "SELECT date FROM (SELECT DISTINCT date FROM broker_summary ORDER BY date DESC LIMIT ?) ORDER BY date ASC LIMIT 1",
-            (days,)
-        ).fetchone()
-        since = cutoff[0] if cutoff else "2020-01-01"
+        since, latest_date, _, _ = resolve_date_window(conn, "broker_summary", symbol=sym, days=days)
+        if not since:
+            return jsonify({"error": f"No broker summary data for '{sym}'"}), 404
+
+        end_date = request.args.get("endDate", "").strip() or latest_date
 
         if broker:
             history = rows_to_list(conn.execute("""
                 SELECT date, broker, buy_qty, sell_qty, net_qty,
                        buy_amount, sell_amount, net_amount,
                        trades_as_buyer, trades_as_seller
-                FROM broker_summary WHERE symbol=? AND broker=? AND date>=?
+                FROM broker_summary
+                WHERE symbol=? AND broker=? AND date BETWEEN ? AND ?
                 ORDER BY date DESC
-            """, (sym, int(broker), since)).fetchall())
-            return jsonify({"symbol": sym, "broker": int(broker), "history": history})
+            """, (sym, int(broker), since, end_date)).fetchall())
+            return jsonify({"symbol": sym, "broker": int(broker), "since": since, "end_date": end_date, "history": history})
 
-        top_buyers = rows_to_list(conn.execute("""
+        broker_rows = rows_to_list(conn.execute("""
             SELECT broker,
-                   SUM(buy_qty)  AS total_buy_qty, SUM(sell_qty)  AS total_sell_qty,
-                   SUM(net_qty)  AS total_net_qty, SUM(net_amount) AS total_net_amount,
-                   SUM(trades_as_buyer) AS total_buys, SUM(trades_as_seller) AS total_sells
-            FROM broker_summary WHERE symbol=? AND date>=?
-            GROUP BY broker ORDER BY total_net_qty DESC LIMIT ?
-        """, (sym, since, top_n)).fetchall())
+                   SUM(buy_qty) AS buy_qty,
+                   SUM(sell_qty) AS sell_qty,
+                   SUM(net_qty) AS net_qty,
+                   SUM(buy_amount) AS buy_amount,
+                   SUM(sell_amount) AS sell_amount,
+                   SUM(net_amount) AS net_amount,
+                   SUM(trades_as_buyer) AS buy_trans,
+                   SUM(trades_as_seller) AS sell_trans
+            FROM broker_summary
+            WHERE symbol=? AND date BETWEEN ? AND ?
+            GROUP BY broker
+        """, (sym, since, end_date)).fetchall())
 
-        top_sellers = rows_to_list(conn.execute("""
-            SELECT broker, SUM(net_qty) AS total_net_qty, SUM(net_amount) AS total_net_amount
-            FROM broker_summary WHERE symbol=? AND date>=?
-            GROUP BY broker ORDER BY total_net_qty ASC LIMIT ?
-        """, (sym, since, top_n)).fetchall())
+        total_buy_qty = sum(float(row["buy_qty"] or 0) for row in broker_rows)
+        total_sell_qty = sum(float(row["sell_qty"] or 0) for row in broker_rows)
+
+        brokers = []
+        for row in broker_rows:
+            buy_qty = float(row["buy_qty"] or 0)
+            sell_qty = float(row["sell_qty"] or 0)
+            buy_amount = float(row["buy_amount"] or 0)
+            sell_amount = float(row["sell_amount"] or 0)
+            net_qty = float(row["net_qty"] or 0)
+            brokers.append({
+                "broker": row["broker"],
+                "buy_qty": buy_qty,
+                "sell_qty": sell_qty,
+                "net_qty": net_qty,
+                "buy_amount": buy_amount,
+                "sell_amount": sell_amount,
+                "net_amount": float(row["net_amount"] or 0),
+                "buy_trans": int(row["buy_trans"] or 0),
+                "sell_trans": int(row["sell_trans"] or 0),
+                "avg_buy": round(buy_amount / buy_qty, 4) if buy_qty else 0,
+                "avg_sell": round(sell_amount / sell_qty, 4) if sell_qty else 0,
+                "buy_qty_pct": round((buy_qty / total_buy_qty) * 100, 4) if total_buy_qty else 0,
+                "sell_qty_pct": round((sell_qty / total_sell_qty) * 100, 4) if total_sell_qty else 0,
+            })
+
+        brokers.sort(key=lambda item: item["net_qty"], reverse=True)
+        top_buyers = brokers[:top_n]
+        top_sellers = sorted(brokers, key=lambda item: item["net_qty"])[:top_n]
 
         daily = rows_to_list(conn.execute("""
             SELECT date, SUM(buy_qty) AS total_buy_qty, SUM(sell_qty) AS total_sell_qty,
                    SUM(net_qty) AS net_qty, COUNT(DISTINCT broker) AS active_brokers
-            FROM broker_summary WHERE symbol=? AND date>=?
+            FROM broker_summary
+            WHERE symbol=? AND date BETWEEN ? AND ?
             GROUP BY date ORDER BY date ASC
-        """, (sym, since)).fetchall())
+        """, (sym, since, end_date)).fetchall())
 
-        return jsonify({"symbol": sym, "days": days, "since": since,
-                        "top_buyers": top_buyers, "top_sellers": top_sellers,
+        return jsonify({"symbol": sym, "days": days, "since": since, "end_date": end_date,
+                        "top_buyers": top_buyers, "top_sellers": top_sellers, "brokers": brokers,
                         "daily_flow": daily})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
+
+
+@app.route("/api/broker/fetch/<symbol>", methods=["POST"])
+def broker_fetch_route(symbol):
+    """
+    Trigger a floorsheet backfill for a single symbol.
+    POST /api/broker/fetch/NABIL?floor_start=2026-01-01&floor_end=2026-03-17
+    Runs synchronously — may take several minutes for large symbols.
+    """
+    sym = symbol.upper()
+    floor_start = request.args.get("floor_start", "2026-01-01")
+    floor_end   = request.args.get("floor_end",   datetime.now().strftime("%Y-%m-%d"))
+
+    try:
+        import subprocess
+        pipeline_path = os.path.join(ROOT, "src", "data", "merolagani_pipeline.py")
+        result = subprocess.run(
+            [
+                sys.executable, pipeline_path,
+                "--symbols", sym,
+                "--floor-start", floor_start,
+                "--floor-end",   floor_end,
+                "--skip-ohlcv",
+            ],
+            capture_output=True, text=True, timeout=600,
+            cwd=ROOT,
+        )
+        if result.returncode != 0:
+            return jsonify({"symbol": sym, "status": "error",
+                            "stderr": result.stderr[-2000:]}), 500
+        return jsonify({"symbol": sym, "status": "ok",
+                        "floor_start": floor_start, "floor_end": floor_end,
+                        "stdout": result.stdout[-2000:]})
+    except subprocess.TimeoutExpired:
+        return jsonify({"symbol": sym, "status": "timeout",
+                        "message": "Pipeline took >10 min. Check logs."}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/broker/leaderboard")
@@ -1182,6 +2153,851 @@ def broker_leaderboard():
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
+@app.route("/api/ml/status")
+def ml_status():
+    conn = get_db()
+    try:
+        freshness = get_data_freshness(conn)
+        latest_signals_date = get_table_max_date(conn, "signals")
+        latest_batch_date = latest_ml_prediction_batch_date(conn)
+        registry_row = latest_model_registry_row(conn)
+        status = "research" if latest_signals_date else "unavailable"
+        active_model = None
+
+        if registry_row:
+            status = "model_ready"
+            active_model = {
+                "model_key": registry_row.get("model_key"),
+                "model_type": registry_row.get("model_type"),
+                "trained_through": registry_row.get("trained_through"),
+                "created_at": registry_row.get("created_at"),
+                "feature_set_version": "ml_feature_snapshot_v1",
+                "label_key": registry_row.get("target"),
+                "prediction_batch_date": latest_batch_date,
+                "validation_metrics": {
+                    "precision": float(registry_row.get("validation_precision") or 0),
+                    "recall": float(registry_row.get("validation_recall") or 0),
+                    "accuracy": float(registry_row.get("validation_accuracy") or 0),
+                },
+            }
+        elif latest_signals_date:
+            active_model = {
+                "model_key": "heuristic_signal_stack",
+                "model_type": "rules_heuristic",
+                "trained_through": latest_signals_date,
+                "created_at": datetime.now().isoformat(),
+                "feature_set_version": "signals+nepse_signals",
+                "label_key": "pending_ml_training",
+            }
+
+        return jsonify({
+            "status": status,
+            "active_model": active_model,
+            "data_freshness": freshness,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/ml/export/latest", methods=["POST"])
+def ml_export_latest():
+    target = request.args.get("target", "label_up_5d_4pct")
+    batch_date = request.args.get("date")
+    model_key = request.args.get("model_key")
+    try:
+        from src.ml.prediction_export import export_latest_lightgbm_predictions
+
+        result = export_latest_lightgbm_predictions(
+            target=target,
+            batch_date=batch_date,
+            model_key=model_key,
+        )
+        return jsonify(result.__dict__)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ml/scores/latest")
+@app.route("/api/ml/predictions/latest")
+def ml_predictions_latest():
+    conn = get_db()
+    try:
+        limit = int(request.args.get("limit", 25))
+        signal = request.args.get("signal", "").upper().strip()
+        model_key = request.args.get("model_key")
+        batch_date = request.args.get("date")
+        rows = fetch_model_prediction_rows(
+            conn,
+            batch_date=batch_date,
+            model_key=model_key,
+            signal=signal or None,
+            limit=max(limit, 1),
+        )
+        if rows:
+            items = [serialize_model_prediction(row) for row in rows]
+            effective_model_key = rows[0].get("model_key")
+            effective_batch_date = rows[0].get("batch_date")
+        else:
+            rows = fetch_heuristic_prediction_rows(conn, batch_date=batch_date, limit=max(limit, 1))
+            items = [serialize_heuristic_prediction(row) for row in rows]
+            if signal:
+                items = [item for item in items if item["prediction"].upper() == signal]
+            effective_model_key = "heuristic_signal_stack"
+            effective_batch_date = rows[0]["date"] if rows else get_table_max_date(conn, "signals")
+
+        return jsonify({
+            "date": effective_batch_date,
+            "model_key": effective_model_key,
+            "items": items[:limit],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/ml/scores/<symbol>")
+@app.route("/api/ml/predict/<symbol>")
+def ml_predict_symbol(symbol):
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        model_key = request.args.get("model_key")
+        rows = fetch_model_prediction_rows(conn, symbol=symbol, batch_date=date, model_key=model_key, limit=1)
+        if rows:
+            row = rows[0]
+            prediction = serialize_model_prediction(row)
+            return jsonify({
+                "symbol": row.get("symbol"),
+                "date": row.get("batch_date"),
+                "model_key": row.get("model_key"),
+                "target": row.get("target"),
+                "prediction": prediction["prediction"],
+                "probability": prediction["probability"],
+                "threshold": prediction["threshold"],
+                "confidence_band": prediction["confidence_band"],
+                "top_drivers": prediction["top_drivers"],
+                "features": prediction["features"],
+                "snapshot": prediction["snapshot"],
+                "validation_metrics": prediction["validation_metrics"],
+            })
+
+        rows = fetch_heuristic_prediction_rows(conn, symbol=symbol, batch_date=date, limit=1)
+        if not rows:
+            return jsonify({"error": f"No prediction payload for '{symbol.upper()}'"}), 404
+
+        row = rows[0]
+        prediction = serialize_heuristic_prediction(row)
+        return jsonify({
+            "symbol": row.get("symbol"),
+            "date": row.get("date"),
+            "model_key": "heuristic_signal_stack",
+            "prediction": prediction["prediction"],
+            "probability": prediction["probability"],
+            "threshold": prediction["threshold"],
+            "confidence_band": prediction["confidence_band"],
+            "top_drivers": prediction["top_drivers"],
+            "features": {
+                "total_score": row.get("total_score"),
+                "signal": row.get("signal"),
+                "market_condition": row.get("market_condition"),
+                "pump_score": row.get("pump_score"),
+                "liquidity_spike": row.get("liquidity_spike"),
+                "broker_accumulation": row.get("broker_accumulation"),
+                "broker_distribution": row.get("broker_distribution"),
+                "net_broker_flow": row.get("net_broker_flow"),
+                "volatility_regime": row.get("volatility_regime"),
+                "volume_score": row.get("volume_score"),
+                "rsi_score": row.get("rsi_score"),
+                "close": row.get("close"),
+                "volume": row.get("volume"),
+            },
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/ml/walk-forward")
+def ml_walk_forward():
+    conn = get_db()
+    try:
+        registry_row = latest_model_registry_row(conn)
+        if registry_row and registry_row.get("meta_path") and os.path.exists(registry_row["meta_path"]):
+            meta = json.loads(open(registry_row["meta_path"], "r", encoding="utf-8").read())
+            windows = meta.get("walk_forward", [])
+            aggregate = {
+                "validation_precision": float((meta.get("validation_metrics") or {}).get("precision", 0)),
+                "validation_recall": float((meta.get("validation_metrics") or {}).get("recall", 0)),
+                "validation_accuracy": float((meta.get("validation_metrics") or {}).get("accuracy", 0)),
+            }
+            return jsonify({
+                "model_key": registry_row.get("model_key"),
+                "label_key": registry_row.get("target"),
+                "windows": windows,
+                "aggregate": aggregate,
+                "as_of": latest_ml_prediction_batch_date(conn, registry_row.get("model_key")),
+            })
+
+        latest_signals_date = get_table_max_date(conn, "signals")
+        return jsonify({
+            "model_key": "heuristic_signal_stack",
+            "label_key": "forward_return_gt_0",
+            "windows": [],
+            "aggregate": {},
+            "as_of": latest_signals_date,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/research/broker-edge")
+def broker_edge_research():
+    conn = get_db()
+    try:
+        threshold = float(request.args.get("threshold", 0.6))
+        windows = compute_broker_edge_windows(conn, threshold=threshold)
+        as_of = get_table_max_date(conn, "broker_summary") or get_table_max_date(conn, "daily_price")
+        return jsonify({
+            "as_of": as_of,
+            "windows": windows,
+            "by_sector": [],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/scanners")
+def scanners_index():
+    conn = get_db()
+    try:
+        as_of = get_latest_snapshot_date(conn, "scanner_results_daily")
+        counts = rows_to_list(
+            conn.execute(
+                """
+                SELECT scanner_name, COUNT(*) AS count, MAX(score) AS top_score
+                FROM scanner_results_daily
+                WHERE date = ?
+                GROUP BY scanner_name
+                ORDER BY scanner_name
+                """,
+                (as_of,),
+            ).fetchall()
+        ) if as_of else []
+        return jsonify({"as_of": as_of, "scanners": counts})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/scanners/<scanner_name>")
+def scanner_results(scanner_name):
+    conn = get_db()
+    try:
+        limit = int(request.args.get("limit", 200))
+        sector = request.args.get("sector", "").strip() or None
+        signal = request.args.get("signal", "").strip() or None
+        date = request.args.get("date")
+        scanner_name = scanner_name.strip().lower()
+        if scanner_name not in DERIVED_SCANNERS:
+            return jsonify({"error": f"Unknown scanner '{scanner_name}'"}), 404
+        rows = fetch_latest_scanner_rows(
+            conn,
+            scanner_name=scanner_name,
+            batch_date=date,
+            limit=max(1, min(limit, 500)),
+            sector=sector,
+            signal=signal,
+        )
+        as_of = date or get_latest_snapshot_date(conn, "scanner_results_daily")
+        return jsonify({"as_of": as_of, "scanner_name": scanner_name, "count": len(rows), "items": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/sector-rotation")
+def sector_rotation():
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        as_of = get_latest_snapshot_date(conn, "sector_factor_snapshot", date)
+        rows = rows_to_list(
+            conn.execute(
+                """
+                SELECT *
+                FROM sector_factor_snapshot
+                WHERE date = ?
+                ORDER BY rotation_score DESC, sector ASC
+                """,
+                (as_of,),
+            ).fetchall()
+        ) if as_of else []
+        return jsonify({"as_of": as_of, "count": len(rows), "sectors": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/sectors/best")
+def best_sectors():
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        limit = int(request.args.get("limit", 10))
+        as_of = get_latest_snapshot_date(conn, "sector_factor_snapshot", date)
+        rows = rows_to_list(
+            conn.execute(
+                """
+                SELECT *
+                FROM sector_factor_snapshot
+                WHERE date = ?
+                ORDER BY sector_strength_score DESC, rotation_score DESC, sector ASC
+                LIMIT ?
+                """,
+                (as_of, max(1, min(limit, 50))),
+            ).fetchall()
+        ) if as_of else []
+        return jsonify({"as_of": as_of, "count": len(rows), "sectors": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/support-resistance")
+def support_resistance_scanner():
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        limit = int(request.args.get("limit", 200))
+        as_of = get_latest_snapshot_date(conn, "support_resistance_levels", date)
+        rows = rows_to_list(
+            conn.execute(
+                """
+                SELECT srl.*, sfs.security_name, sfs.sector, sfs.close, sfs.change_pct,
+                       sfs.signal_label, sfs.composite_score, sfs.risk_score
+                FROM support_resistance_levels srl
+                LEFT JOIN stock_factor_snapshot sfs
+                  ON sfs.date = srl.date AND sfs.symbol = srl.symbol
+                WHERE srl.date = ?
+                ORDER BY sfs.support_resistance_score DESC, sfs.composite_score DESC, srl.symbol ASC
+                LIMIT ?
+                """,
+                (as_of, max(1, min(limit, 500))),
+            ).fetchall()
+        ) if as_of else []
+        return jsonify({"as_of": as_of, "count": len(rows), "items": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/support-resistance/<symbol>")
+def support_resistance_symbol(symbol):
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        as_of = get_latest_snapshot_date(conn, "support_resistance_levels", date)
+        row = conn.execute(
+            """
+            SELECT srl.*, sfs.security_name, sfs.sector, sfs.close, sfs.change_pct,
+                   sfs.signal_label, sfs.composite_score, sfs.risk_score
+            FROM support_resistance_levels srl
+            LEFT JOIN stock_factor_snapshot sfs
+              ON sfs.date = srl.date AND sfs.symbol = srl.symbol
+            WHERE srl.date = ? AND srl.symbol = ?
+            """,
+            (as_of, symbol.upper()),
+        ).fetchone() if as_of else None
+        if not row:
+            return jsonify({"error": f"No support/resistance snapshot for '{symbol.upper()}'"}), 404
+        return jsonify({"as_of": as_of, "item": dict(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/broker-analytics/<symbol>")
+def broker_analytics_symbol(symbol):
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        limit = int(request.args.get("limit", 100))
+        mode = request.args.get("mode", "smart_money").strip().lower()
+        order_map = {
+            "smart_money": "smart_money_score DESC, net_qty DESC",
+            "accumulation": "accumulation_score DESC, net_qty DESC",
+            "distribution": "distribution_score DESC, net_qty ASC",
+            "participation": "participation_pct DESC, gross_qty DESC",
+        }
+        order_sql = order_map.get(mode, order_map["smart_money"])
+        as_of = get_latest_snapshot_date(conn, "broker_analytics_daily", date)
+        rows = rows_to_list(
+            conn.execute(
+                f"""
+                SELECT *
+                FROM broker_analytics_daily
+                WHERE date = ? AND symbol = ?
+                ORDER BY {order_sql}, broker ASC
+                LIMIT ?
+                """,
+                (as_of, symbol.upper(), max(1, min(limit, 500))),
+            ).fetchall()
+        ) if as_of else []
+        summary = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS broker_count,
+                SUM(buy_qty) AS total_buy_qty,
+                SUM(sell_qty) AS total_sell_qty,
+                SUM(net_qty) AS total_net_qty,
+                SUM(gross_turnover) AS gross_turnover,
+                AVG(smart_money_score) AS avg_smart_money_score
+            FROM broker_analytics_daily
+            WHERE date = ? AND symbol = ?
+            """,
+            (as_of, symbol.upper()),
+        ).fetchone() if as_of else None
+        return jsonify({
+            "as_of": as_of,
+            "symbol": symbol.upper(),
+            "mode": mode,
+            "summary": row_to_dict(summary),
+            "count": len(rows),
+            "items": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/stock-profile/<symbol>")
+def stock_profile_v2(symbol):
+    conn = get_db()
+    try:
+        date = request.args.get("date")
+        as_of = get_latest_snapshot_date(conn, "stock_factor_snapshot", date)
+        snapshot = conn.execute(
+            "SELECT * FROM stock_factor_snapshot WHERE date = ? AND symbol = ?",
+            (as_of, symbol.upper()),
+        ).fetchone() if as_of else None
+        if not snapshot:
+            return jsonify({"error": f"No stock factor snapshot for '{symbol.upper()}'"}), 404
+
+        levels = conn.execute(
+            "SELECT * FROM support_resistance_levels WHERE date = ? AND symbol = ?",
+            (as_of, symbol.upper()),
+        ).fetchone()
+        top_buyers = rows_to_list(
+            conn.execute(
+                """
+                SELECT broker, buy_qty, net_qty, buy_amount, smart_money_score, participation_pct
+                FROM broker_analytics_daily
+                WHERE date = ? AND symbol = ?
+                ORDER BY accumulation_score DESC, net_qty DESC
+                LIMIT 5
+                """,
+                (as_of, symbol.upper()),
+            ).fetchall()
+        )
+        top_sellers = rows_to_list(
+            conn.execute(
+                """
+                SELECT broker, sell_qty, net_qty, sell_amount, smart_money_score, participation_pct
+                FROM broker_analytics_daily
+                WHERE date = ? AND symbol = ?
+                ORDER BY distribution_score DESC, net_qty ASC
+                LIMIT 5
+                """,
+                (as_of, symbol.upper()),
+            ).fetchall()
+        )
+        company = conn.execute("SELECT * FROM about_company WHERE symbol = ?", (symbol.upper(),)).fetchone()
+        news_rows = rows_to_list(
+            conn.execute(
+                "SELECT * FROM news WHERE symbol = ? ORDER BY fetched_at DESC LIMIT 5",
+                (symbol.upper(),),
+            ).fetchall()
+        ) if table_exists(conn, "news") else []
+        dividend_rows = rows_to_list(
+            conn.execute(
+                "SELECT * FROM dividend WHERE symbol = ? ORDER BY fetched_at DESC LIMIT 5",
+                (symbol.upper(),),
+            ).fetchall()
+        ) if table_exists(conn, "dividend") else []
+
+        return jsonify({
+            "as_of": as_of,
+            "symbol": symbol.upper(),
+            "snapshot": dict(snapshot),
+            "support_resistance": row_to_dict(levels),
+            "broker": {"top_buyers": top_buyers, "top_sellers": top_sellers},
+            "company": row_to_dict(company),
+            "news": news_rows,
+            "dividends": dividend_rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/meroshare/accounts", methods=["GET", "POST"])
+def meroshare_accounts_route():
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        if request.method == "POST":
+            body = request.get_json(force=True) or {}
+            client_id = body.get("client_id")
+            username = str(body.get("username", "")).strip()
+            password = body.get("password")
+            label = str(body.get("label", "")).strip() or None
+            if client_id in (None, "") or not username or not password:
+                return jsonify({"error": "client_id, username, and password are required"}), 400
+            account = connect_meroshare_account(
+                conn,
+                client_id=int(client_id),
+                username=username,
+                password=str(password),
+                label=label,
+            )
+            return jsonify({"account": sanitize_meroshare_account(account), "status": "connected"})
+        rows = [sanitize_meroshare_account(row) for row in list_meroshare_accounts(conn)]
+        return jsonify({"accounts": rows, "count": len(rows)})
+    except MeroShareClientError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/meroshare/dps", methods=["GET"])
+def meroshare_dps_route():
+    try:
+        client = MeroShareClient()
+        rows = client.get_depository_participants()
+        return jsonify({"participants": rows, "count": len(rows)})
+    except MeroShareClientError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/meroshare/accounts/<int:account_id>", methods=["GET"])
+def meroshare_account_detail_route(account_id):
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        account = get_meroshare_account(conn, account_id)
+        if not account:
+            return jsonify({"error": "MeroShare account not found"}), 404
+        return jsonify({"account": sanitize_meroshare_account(account)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/meroshare/accounts/<int:account_id>/sync", methods=["POST"])
+def meroshare_account_sync_route(account_id):
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        body = request.get_json(force=True) or {}
+        password = body.get("password")
+        include_transactions = bool(body.get("include_transactions", True))
+        result = sync_meroshare_account(
+            conn,
+            account_id,
+            password=str(password) if password else None,
+            include_transactions=include_transactions,
+        )
+        if result.get("account"):
+            result["account"] = sanitize_meroshare_account(result["account"])
+        return jsonify(result)
+    except MeroShareSessionExpired as e:
+        return jsonify(
+            {
+                "error": "MeroShare session expired. Provide password to refresh the session.",
+                "details": str(e),
+            }
+        ), 401
+    except MeroShareClientError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/meroshare/accounts/<int:account_id>/holdings")
+def meroshare_account_holdings_route(account_id):
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        latest_only = str(request.args.get("latest_only", "true")).lower() not in {"0", "false", "no"}
+        return jsonify(get_meroshare_holdings(conn, account_id, latest_only=latest_only))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/meroshare/accounts/<int:account_id>/purchase-history")
+def meroshare_account_purchase_history_route(account_id):
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        return jsonify(get_meroshare_purchase_history(conn, account_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/meroshare/accounts/<int:account_id>/transactions")
+def meroshare_account_transactions_route(account_id):
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        return jsonify(get_meroshare_transactions(conn, account_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/portfolios/<int:portfolio_id>/import-meroshare/<int:account_id>", methods=["POST"])
+def portfolio_import_meroshare_route(portfolio_id, account_id):
+    conn = get_db()
+    try:
+        ensure_meroshare_tables(conn)
+        return jsonify(import_meroshare_holdings_to_portfolio(conn, portfolio_id, account_id))
+    except MeroShareClientError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/watchlists", methods=["GET", "POST"])
+def watchlists_route():
+    conn = get_db()
+    try:
+        if request.method == "POST":
+            body = request.get_json(force=True) or {}
+            name = str(body.get("name", "")).strip()
+            if not name:
+                return jsonify({"error": "name is required"}), 400
+            conn.execute("INSERT INTO watchlists(name) VALUES (?)", (name,))
+            conn.commit()
+        rows = rows_to_list(
+            conn.execute(
+                """
+                SELECT w.*, COUNT(wi.symbol) AS item_count
+                FROM watchlists w
+                LEFT JOIN watchlist_items wi
+                  ON wi.watchlist_id = w.id
+                GROUP BY w.id
+                ORDER BY w.created_at DESC, w.id DESC
+                """
+            ).fetchall()
+        )
+        return jsonify({"watchlists": rows, "count": len(rows)})
+    except sqlite3.IntegrityError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/watchlists/<int:watchlist_id>", methods=["GET", "POST", "DELETE"])
+def watchlist_detail_route(watchlist_id):
+    conn = get_db()
+    try:
+        if request.method == "DELETE":
+            conn.execute("DELETE FROM watchlist_items WHERE watchlist_id = ?", (watchlist_id,))
+            conn.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+            conn.commit()
+            return jsonify({"status": "deleted", "watchlist_id": watchlist_id})
+
+        if request.method == "POST":
+            body = request.get_json(force=True) or {}
+            symbol = str(body.get("symbol", "")).upper().strip()
+            notes = body.get("notes")
+            if not symbol:
+                return jsonify({"error": "symbol is required"}), 400
+            conn.execute(
+                """
+                INSERT INTO watchlist_items(watchlist_id, symbol, notes)
+                VALUES (?, ?, ?)
+                ON CONFLICT(watchlist_id, symbol) DO UPDATE SET notes=excluded.notes
+                """,
+                (watchlist_id, symbol, notes),
+            )
+            conn.commit()
+
+        header = conn.execute("SELECT * FROM watchlists WHERE id = ?", (watchlist_id,)).fetchone()
+        if not header:
+            return jsonify({"error": "watchlist not found"}), 404
+        items = rows_to_list(
+            conn.execute(
+                """
+                SELECT wi.*, sfs.security_name, sfs.sector, sfs.close, sfs.change_pct,
+                       sfs.signal_label, sfs.composite_score
+                FROM watchlist_items wi
+                LEFT JOIN stock_factor_snapshot sfs
+                  ON sfs.symbol = wi.symbol
+                 AND sfs.date = (SELECT MAX(date) FROM stock_factor_snapshot)
+                WHERE wi.watchlist_id = ?
+                ORDER BY wi.added_at DESC, wi.symbol ASC
+                """,
+                (watchlist_id,),
+            ).fetchall()
+        )
+        return jsonify({"watchlist": dict(header), "items": items, "count": len(items)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/watchlists/<int:watchlist_id>/items/<symbol>", methods=["DELETE"])
+def watchlist_item_delete_route(watchlist_id, symbol):
+    conn = get_db()
+    try:
+        conn.execute(
+            "DELETE FROM watchlist_items WHERE watchlist_id = ? AND symbol = ?",
+            (watchlist_id, symbol.upper()),
+        )
+        conn.commit()
+        return jsonify({"status": "deleted", "watchlist_id": watchlist_id, "symbol": symbol.upper()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/portfolios", methods=["GET", "POST"])
+def portfolios_route():
+    conn = get_db()
+    try:
+        if request.method == "POST":
+            body = request.get_json(force=True) or {}
+            name = str(body.get("name", "")).strip()
+            if not name:
+                return jsonify({"error": "name is required"}), 400
+            conn.execute("INSERT INTO portfolios(name) VALUES (?)", (name,))
+            conn.commit()
+        rows = rows_to_list(
+            conn.execute(
+                """
+                SELECT p.*, COUNT(pp.symbol) AS position_count
+                FROM portfolios p
+                LEFT JOIN portfolio_positions pp
+                  ON pp.portfolio_id = p.id
+                GROUP BY p.id
+                ORDER BY p.created_at DESC, p.id DESC
+                """
+            ).fetchall()
+        )
+        return jsonify({"portfolios": rows, "count": len(rows)})
+    except sqlite3.IntegrityError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/portfolios/<int:portfolio_id>", methods=["GET", "POST", "DELETE"])
+def portfolio_detail_route(portfolio_id):
+    conn = get_db()
+    try:
+        if request.method == "DELETE":
+            conn.execute("DELETE FROM portfolio_positions WHERE portfolio_id = ?", (portfolio_id,))
+            conn.execute("DELETE FROM portfolios WHERE id = ?", (portfolio_id,))
+            conn.commit()
+            return jsonify({"status": "deleted", "portfolio_id": portfolio_id})
+
+        if request.method == "POST":
+            body = request.get_json(force=True) or {}
+            symbol = str(body.get("symbol", "")).upper().strip()
+            qty = float(body.get("qty", 0) or 0)
+            avg_cost = float(body.get("avg_cost", 0) or 0)
+            notes = body.get("notes")
+            if not symbol:
+                return jsonify({"error": "symbol is required"}), 400
+            conn.execute(
+                """
+                INSERT INTO portfolio_positions(portfolio_id, symbol, qty, avg_cost, notes)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(portfolio_id, symbol)
+                DO UPDATE SET qty=excluded.qty, avg_cost=excluded.avg_cost, notes=excluded.notes
+                """,
+                (portfolio_id, symbol, qty, avg_cost, notes),
+            )
+            conn.commit()
+
+        header = conn.execute("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
+        if not header:
+            return jsonify({"error": "portfolio not found"}), 404
+        health = compute_portfolio_health(conn, portfolio_id)
+        return jsonify({"portfolio": dict(header), **health})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/portfolios/<int:portfolio_id>/positions/<symbol>", methods=["DELETE"])
+def portfolio_position_delete_route(portfolio_id, symbol):
+    conn = get_db()
+    try:
+        conn.execute(
+            "DELETE FROM portfolio_positions WHERE portfolio_id = ? AND symbol = ?",
+            (portfolio_id, symbol.upper()),
+        )
+        conn.commit()
+        return jsonify({"status": "deleted", "portfolio_id": portfolio_id, "symbol": symbol.upper()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/health-check/<int:portfolio_id>")
+def portfolio_health_check_route(portfolio_id):
+    conn = get_db()
+    try:
+        header = conn.execute("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
+        if not header:
+            return jsonify({"error": "portfolio not found"}), 404
+        return jsonify(compute_portfolio_health(conn, portfolio_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     print("=" * 55)
     print("NEPSE API Server")

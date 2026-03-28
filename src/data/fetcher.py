@@ -40,6 +40,19 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def ensure_sector_index_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sector_index (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            date        TEXT NOT NULL,
+            sector      TEXT NOT NULL,
+            value       REAL,
+            fetched_at  TEXT,
+            UNIQUE(date, sector)
+        )
+    """)
+
 # ── HTTP SESSION ───────────────────────────────────────────────────────────────
 # Merolagani is tolerant of scrapers but we add realistic headers + small delays
 # to be polite and avoid getting throttled during bulk fetches.
@@ -60,6 +73,8 @@ BASE_URL   = "https://merolagani.com"
 COMPANY_LIST_URL = f"{BASE_URL}/CompanyList.aspx"
 COMPANY_DETAIL_URL = f"{BASE_URL}/CompanyDetail.aspx"
 SHARESANSAR_BASE_URL = "https://www.sharesansar.com"
+SHAREHUB_PRICE_HISTORY_URL = "https://sharehubnepal.com/data/api/v1/price-history"
+CHUKUL_MARKET_SUMMARY_URL = "https://chukul.com/api/data/v2/market-summary/"
 
 # Delay between requests (seconds) — randomised to be polite
 MIN_DELAY = 0.4
@@ -432,6 +447,67 @@ def _fetch_price_history_from_sharesansar(symbol):
     df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
     return df
 
+
+def _fetch_price_history_from_sharehub(symbol, page_size=500, start_date=None, end_date=None):
+    print(f"   Fetching from ShareHub price history for {symbol}...")
+    page = 1
+    frames = []
+
+    while True:
+        params = {
+            "symbol": symbol.upper(),
+            "pageIndex": page,
+            "pageSize": page_size,
+        }
+        resp = SESSION.get(SHAREHUB_PRICE_HISTORY_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        payload = data.get("data") or {}
+        rows = payload.get("content") or []
+        if not rows:
+            break
+
+        frame = pd.DataFrame(
+            [
+                {
+                    "date": row.get("date"),
+                    "open": float(row.get("open") or 0),
+                    "high": float(row.get("high") or 0),
+                    "low": float(row.get("low") or 0),
+                    "close": float(row.get("close") or 0),
+                    "volume": float(row.get("volume") or 0),
+                }
+                for row in rows
+                if row.get("date")
+            ]
+        )
+        if not frame.empty:
+            frames.append(frame)
+
+        total_pages = int(payload.get("totalPages") or 1)
+        if page >= total_pages:
+            break
+        page += 1
+        time.sleep(random.uniform(0.1, 0.25))
+
+    if not frames:
+        return None
+
+    df = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset=["date"])
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    if start_date is not None:
+        df = df[df["date"] >= start_date]
+    if end_date is not None:
+        df = df[df["date"] <= end_date]
+
+    return df.reset_index(drop=True)
+
 # ── CREATE TABLES ──────────────────────────────────────────────────────────────
 def create_tables():
     """Create all database tables if they don't exist."""
@@ -490,9 +566,11 @@ def create_tables():
         )
     """)
 
+    ensure_sector_index_table(conn)
+
     conn.commit()
     conn.close()
-    print("✅ Tables created successfully")
+    print("[OK] Tables created successfully")
 
 
 # ── COMPANY LIST ───────────────────────────────────────────────────────────────
@@ -514,10 +592,12 @@ def fetch_company_list():
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # Find the main company table — it's the first <table class="table">
+
         table = soup.find("table", class_="table")
         if not table:
-            print("❌ Could not find company table on Merolagani")
-            return None
+            print("[WARN] Could not find company table on Merolagani. Skipping company list update.")
+            import pandas as pd
+            return pd.DataFrame([])
 
         for tr in table.find("tbody").find_all("tr"):
             tds = tr.find_all("td")
@@ -552,11 +632,11 @@ def fetch_company_list():
 
         conn.commit()
         conn.close()
-        print(f"✅ Saved {len(df)} companies to database")
+        print(f"[OK] Saved {len(df)} companies to database")
         return df
 
     except Exception as e:
-        print(f"❌ Error fetching company list: {e}")
+        print(f"[ERROR] Error fetching company list: {e}")
         import traceback; traceback.print_exc()
         return None
 
@@ -616,9 +696,14 @@ def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
 
     from_ts = _unix(range_start)
     to_ts = _unix(range_end)
+    start_str = range_start.strftime("%Y-%m-%d")
+    end_str = range_end.strftime("%Y-%m-%d")
 
     try:
-        df = _fetch_price_history_from_merolagani_history_tab(symbol)
+        df = _fetch_price_history_from_sharehub(symbol, start_date=start_str, end_date=end_str)
+
+        if df is None or df.empty:
+            df = _fetch_price_history_from_merolagani_history_tab(symbol)
 
         # Fallback 1: Merolagani advanced chart endpoint
         if df is None or df.empty:
@@ -699,11 +784,11 @@ def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
 
         conn.commit()
         conn.close()
-        print(f"✅ Saved {saved} rows for {symbol}")
+        print(f"[OK] Saved {saved} rows for {symbol}")
         return df
 
     except Exception as e:
-        print(f"❌ Error fetching {symbol}: {e}")
+        print(f"[ERROR] Error fetching {symbol}: {e}")
         import traceback; traceback.print_exc()
         return None
 
@@ -711,8 +796,8 @@ def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
 # ── BULK PRICE HISTORY (PARALLEL) ─────────────────────────────────────────────
 def fetch_all_price_histories(max_workers=3):
     """
-    Fetch price history for every company in the DB using parallel threads.
-    max_workers=3 to avoid hammering Merolagani and to stay within Railway RAM.
+    Fetch price history incrementally for every company in the DB using parallel threads.
+    max_workers=3 keeps API pressure moderate while still updating quickly.
     """
     conn = get_db()
     symbols = [row[0] for row in conn.execute("SELECT symbol FROM companies").fetchall()]
@@ -726,7 +811,7 @@ def fetch_all_price_histories(max_workers=3):
 
     def process_one(symbol):
         try:
-            result = fetch_price_history(symbol)
+            result = fetch_price_history_incremental(symbol)
             return symbol, result is not None
         except Exception:
             return symbol, False
@@ -741,9 +826,9 @@ def fetch_all_price_histories(max_workers=3):
             else:
                 failed += 1
             if completed % 20 == 0:
-                print(f"Progress: {completed}/{total} | ✅ {success} | ❌ {failed}")
+                print(f"Progress: {completed}/{total} | OK {success} | Failed {failed}")
 
-    print(f"\n✅ Done. Success: {success} | Failed: {failed}")
+    print(f"\n[OK] Done. Success: {success} | Failed: {failed}")
 
 
 def fetch_all_price_history(max_workers=3):
@@ -824,11 +909,11 @@ def fetch_floor_sheet_for(symbol):
 
         conn.commit()
         conn.close()
-        print(f"✅ Saved floor sheet for {symbol}")
+        print(f"[OK] Saved floor sheet for {symbol}")
         return df
 
     except Exception as e:
-        print(f"❌ Error fetching floor sheet for {symbol}: {e}")
+        print(f"[ERROR] Error fetching floor sheet for {symbol}: {e}")
         import traceback; traceback.print_exc()
         return None
 
@@ -854,6 +939,58 @@ def fetch_market_summary():
     conn = get_db()
 
     try:
+        ensure_sector_index_table(conn)
+
+        # Method 0: Chukul market-summary index feed (preferred)
+        try:
+            resp = SESSION.get(CHUKUL_MARKET_SUMMARY_URL, params={"type": "index"}, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                dated_rows = [row for row in data if str(row.get("date", "")).strip()]
+                target_date = max((str(row.get("date")) for row in dated_rows), default=today)
+                target_rows = [row for row in dated_rows if str(row.get("date")) == target_date]
+
+                nepse_row = next((row for row in target_rows if str(row.get("symbol")).upper() == "NEPSE"), None)
+                if nepse_row:
+                    nepse_index = float(nepse_row.get("close") or 0)
+                    total_turnover = float(nepse_row.get("amount") or 0)
+                    total_volume = float(nepse_row.get("volume") or 0)
+
+                    conn.execute("""
+                        INSERT OR REPLACE INTO market_summary
+                        (date, nepse_index, total_turnover, total_volume, fetched_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (target_date, nepse_index, total_turnover, total_volume, fetched_at))
+
+                    conn.execute("DELETE FROM sector_index WHERE date = ?", (target_date,))
+                    for row in target_rows:
+                        symbol = str(row.get("symbol", "")).upper()
+                        if symbol == "NEPSE":
+                            sector_name = "NEPSE"
+                        else:
+                            sector_name = symbol
+                        conn.execute("""
+                            INSERT OR REPLACE INTO sector_index (date, sector, value, fetched_at)
+                            VALUES (?, ?, ?, ?)
+                        """, (
+                            target_date,
+                            sector_name,
+                            float(row.get("close") or 0),
+                            fetched_at,
+                        ))
+
+                    conn.commit()
+                    print(f"[OK] Market summary saved from Chukul for {target_date}")
+                    return {
+                        "date": target_date,
+                        "nepse_index": nepse_index,
+                        "total_turnover": total_turnover,
+                        "total_volume": total_volume,
+                    }
+        except Exception as chukul_err:
+            print(f"   Chukul index feed failed, falling back to legacy sources: {chukul_err}")
+
         # ── Method 1: JSON chart handler for NEPSE index ───────────────────────
         now = datetime.now()
         params = {
@@ -905,7 +1042,7 @@ def fetch_market_summary():
             VALUES (?, ?, ?, ?, ?)
         """, (today, nepse_index, total_turnover, total_volume, fetched_at))
         conn.commit()
-        print("✅ Market summary saved")
+        print("[OK] Market summary saved")
 
         return {
             "date":           today,
@@ -915,7 +1052,7 @@ def fetch_market_summary():
         }
 
     except Exception as e:
-        print(f"❌ Error fetching market summary: {e}")
+        print(f"[ERROR] Error fetching market summary: {e}")
         import traceback; traceback.print_exc()
         return None
     finally:
@@ -939,48 +1076,54 @@ def fetch_price_history_incremental(symbol):
     if last_date:
         # Fetch from the day after our last record
         from_dt = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
-        years_back = max(1, (datetime.now() - from_dt).days / 365)
         print(f"   Incremental: fetching {symbol} from {from_dt.date()} (last known: {last_date})")
+        return fetch_price_history(symbol, start_date=from_dt.strftime("%Y-%m-%d"))
     else:
-        years_back = 15  # Full history for new symbols
         print(f"   Full fetch for new symbol: {symbol}")
-
-    return fetch_price_history(symbol, years_back=years_back)
+        return fetch_price_history(symbol, years_back=15)
 
 
 # ── MAIN TEST RUN ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 55)
-    print("NEPSE Data Fetcher — Merolagani Scraper Edition")
-    print("=" * 55)
+    # CLI interface for targeted fetches
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "fetch_price_history":
+        symbol = sys.argv[2]
+        print(f"[CLI] Fetching price history for symbol: {symbol}")
+        create_tables()
+        fetch_price_history(symbol)
+    else:
+        print("=" * 55)
+        print("NEPSE Data Fetcher — Merolagani Scraper Edition")
+        print("=" * 55)
 
-    # 1. Create tables
-    create_tables()
+        # 1. Create tables
+        create_tables()
 
-    # 2. Fetch company list
-    companies = fetch_company_list()
+        # 2. Fetch company list
+        companies = fetch_company_list()
 
-    # 3. Test price history with a couple of stocks
-    for sym in ["NABIL", "NICA", "SCB"]:
-        fetch_price_history(sym)
+        # 3. Test price history with a couple of stocks
+        for sym in ["NABIL", "NICA", "SCB"]:
+            fetch_price_history(sym)
 
-    # 4. Fetch market summary
-    fetch_market_summary()
+        # 4. Fetch market summary
+        fetch_market_summary()
 
-    # 5. Database summary
-    conn = get_db()
-    print("\n📊 Database summary:")
-    print(f"   Companies:     {conn.execute('SELECT COUNT(*) FROM companies').fetchone()[0]}")
-    print(f"   Price rows:    {conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0]}")
-    print(f"   Floor trades:  {conn.execute('SELECT COUNT(*) FROM floor_sheet').fetchone()[0]}")
+        # 5. Database summary
+        conn = get_db()
+        print("\n[INFO] Database summary:")
+        print(f"   Companies:     {conn.execute('SELECT COUNT(*) FROM companies').fetchone()[0]}")
+        print(f"   Price rows:    {conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0]}")
+        print(f"   Floor trades:  {conn.execute('SELECT COUNT(*) FROM floor_sheet').fetchone()[0]}")
 
-    # Show date range per tested symbol
-    for sym in ["NABIL", "NICA", "SCB"]:
-        r = conn.execute(
-            "SELECT MIN(date), MAX(date), COUNT(*) FROM price_history WHERE symbol=?", (sym,)
-        ).fetchone()
-        if r and r[0]:
-            print(f"   {sym}: {r[0]} → {r[1]} ({r[2]} rows)")
-    conn.close()
+        # Show date range per tested symbol
+        for sym in ["NABIL", "NICA", "SCB"]:
+            r = conn.execute(
+                "SELECT MIN(date), MAX(date), COUNT(*) FROM price_history WHERE symbol=?", (sym,)
+            ).fetchone()
+            if r and r[0]:
+                print(f"   {sym}: {r[0]} → {r[1]} ({r[2]} rows)")
+        conn.close()
 
-    print("\n✅ Step 2 complete! Merolagani scraper is working.")
+        print("\n[OK] Step 2 complete! Merolagani scraper is working.")

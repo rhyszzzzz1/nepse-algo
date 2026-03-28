@@ -65,7 +65,6 @@ def step1_fetch():
     """Fetch fresh price/floor-sheet/market-summary data from NEPSE API."""
     header("Step 1: Fetch NEPSE data")
     from data.fetcher import fetch_all_price_history, fetch_market_summary
-    from data.broker_fetcher import fetch_sector_indices
 
     ok("Fetching all price history...")
     fetch_all_price_history()
@@ -73,8 +72,12 @@ def step1_fetch():
     ok("Fetching market summary...")
     fetch_market_summary()
 
-    ok("Fetching sector indices...")
-    fetch_sector_indices()
+    try:
+        from data.broker_fetcher import fetch_sector_indices
+        ok("Fetching sector indices...")
+        fetch_sector_indices()
+    except Exception as exc:
+        print(f"  [WARN] Sector index fetch skipped: {exc}")
 
 
 def step2_clean():
