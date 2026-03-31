@@ -1,0 +1,164 @@
+{
+  "target": "label_up_5d_4pct",
+  "threshold": 0.55,
+  "feature_count": 61,
+  "training_rows": 211627,
+  "validation_rows": 62202,
+  "train_start": "2022-01-25",
+  "train_end": "2025-05-11",
+  "validation_start": "2025-05-13",
+  "validation_end": "2026-03-26",
+  "train_metrics": {
+    "precision": 0.49171151388613904,
+    "recall": 0.6768662818066946,
+    "accuracy": 0.8049303727785208,
+    "positive_rate": 0.19071763054808696,
+    "mean_probability": 0.4179085836607175
+  },
+  "validation_metrics": {
+    "precision": 0.2640710223975862,
+    "recall": 0.4747548508241185,
+    "accuracy": 0.7151538535738401,
+    "positive_rate": 0.15411080029581042,
+    "mean_probability": 0.44033427846731366
+  },
+  "top_features": [
+    {
+      "feature": "sector_strength_rank_pct",
+      "importance": 4319
+    },
+    {
+      "feature": "close",
+      "importance": 928
+    },
+    {
+      "feature": "ret_20d",
+      "importance": 745
+    },
+    {
+      "feature": "volatility_20d",
+      "importance": 702
+    },
+    {
+      "feature": "macd",
+      "importance": 615
+    },
+    {
+      "feature": "ret_10d",
+      "importance": 601
+    },
+    {
+      "feature": "trades_ratio_5_20",
+      "importance": 570
+    },
+    {
+      "feature": "macd_hist",
+      "importance": 567
+    },
+    {
+      "feature": "rsi_delta_3d",
+      "importance": 550
+    },
+    {
+      "feature": "close_vs_20d_high_pct",
+      "importance": 534
+    },
+    {
+      "feature": "ret_5d",
+      "importance": 490
+    },
+    {
+      "feature": "score_ma_10",
+      "importance": 484
+    },
+    {
+      "feature": "bb_pct",
+      "importance": 459
+    },
+    {
+      "feature": "close_vs_20d_low_pct",
+      "importance": 457
+    },
+    {
+      "feature": "ret_3d",
+      "importance": 448
+    },
+    {
+      "feature": "broker_avg_trade_size",
+      "importance": 439
+    },
+    {
+      "feature": "rsi14",
+      "importance": 417
+    },
+    {
+      "feature": "distance_from_ema20_pct",
+      "importance": 392
+    },
+    {
+      "feature": "change_pct",
+      "importance": 380
+    },
+    {
+      "feature": "volatility_5d",
+      "importance": 378
+    },
+    {
+      "feature": "atr14",
+      "importance": 378
+    },
+    {
+      "feature": "turnover",
+      "importance": 351
+    },
+    {
+      "feature": "broker_top5_buy_amount_share",
+      "importance": 305
+    },
+    {
+      "feature": "turnover_ratio_3_20",
+      "importance": 289
+    },
+    {
+      "feature": "trades",
+      "importance": 284
+    }
+  ],
+  "walk_forward": [
+    {
+      "train_end": "2022-11-09",
+      "test_start": "2022-11-10",
+      "test_end": "2023-08-30",
+      "sample_count": 50077,
+      "positive_rate": 0.18425624538211155,
+      "precision": 0.42036124794745483,
+      "recall": 0.02774466240381489,
+      "accuracy": 0.813806737624059,
+      "mean_probability": 0.08239866175102417
+    },
+    {
+      "train_end": "2023-08-30",
+      "test_start": "2023-09-03",
+      "test_end": "2024-07-08",
+      "sample_count": 57826,
+      "positive_rate": 0.21661536333137343,
+      "precision": 0.23817937391972344,
+      "recall": 0.49505029538559797,
+      "accuracy": 0.5476256355272715,
+      "mean_probability": 0.5016111819497094
+    },
+    {
+      "train_end": "2024-07-08",
+      "test_start": "2024-07-09",
+      "test_end": "2025-05-11",
+      "sample_count": 60466,
+      "positive_rate": 0.20317203056263025,
+      "precision": 0.30583865952668854,
+      "recall": 0.5764753764753765,
+      "accuracy": 0.6481162967618166,
+      "mean_probability": 0.48596348462381017
+    }
+  ],
+  "model_path": "C:\\nepse-algo\\data\\models\\lightgbm_label_up_5d_4pct_20260326T191433Z.pkl",
+  "importance_path": "C:\\nepse-algo\\data\\models\\lightgbm_label_up_5d_4pct_20260326T191433Z_feature_importance.csv"
+}

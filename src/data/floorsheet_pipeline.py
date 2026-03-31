@@ -13,6 +13,7 @@
 import os, re, sys, time, random, sqlite3, traceback, csv
 from datetime import datetime, timedelta
 from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 
@@ -53,6 +54,10 @@ KEEP_RAW_DAYS = 0
 # Rows older than this are pruned when --prune-raw is used.
 BROKER_SUMMARY_KEEP_DAYS = 400   # ~13 months gives headroom beyond 1 year
 
+CHUKUL_FLOORSHEET_BY_DATE_URL = "https://chukul.com/api/data/v2/floorsheet/bydate/"
+SHAREHUB_FLOORSHEET_BY_DATE_URL = "https://sharehubnepal.com/live/api/v2/floorsheet"
+SHAREHUB_TODAYS_PRICE_URL = "https://sharehubnepal.com/live/api/v2/nepselive/todays-price"
+
 
 # ── ENSURE SCHEMA ─────────────────────────────────────────────────────────────
 def ensure_schema():
@@ -67,11 +72,29 @@ def ensure_schema():
             quantity      REAL,
             rate          REAL,
             amount        REAL,
-            fetched_at    TEXT
+            fetched_at    TEXT,
+            transaction_no TEXT,
+            source_file    TEXT,
+            page_no        INTEGER,
+            row_no_in_page INTEGER
         )
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(floor_sheet)").fetchall()}
+    if "transaction_no" not in cols:
+        conn.execute("ALTER TABLE floor_sheet ADD COLUMN transaction_no TEXT")
+    if "source_file" not in cols:
+        conn.execute("ALTER TABLE floor_sheet ADD COLUMN source_file TEXT")
+    if "page_no" not in cols:
+        conn.execute("ALTER TABLE floor_sheet ADD COLUMN page_no INTEGER")
+    if "row_no_in_page" not in cols:
+        conn.execute("ALTER TABLE floor_sheet ADD COLUMN row_no_in_page INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fs_date_sym ON floor_sheet(date, symbol)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fs_date     ON floor_sheet(date)")
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fs_unique_txn
+        ON floor_sheet(date, symbol, transaction_no)
+        WHERE transaction_no IS NOT NULL AND transaction_no != ''
+    """)
 
     # Migrate broker_summary if it has the old schema
     cols = [r[1] for r in conn.execute("PRAGMA table_info(broker_summary)").fetchall()]
@@ -142,6 +165,29 @@ def _float(s):
 def _int(s):
     try: return int(float(str(s).replace(",", "").strip() or 0))
     except: return 0
+
+def _http_get_json(url, params=None, timeout=30):
+    last_error = None
+    for attempt in range(5):
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            if resp.status_code == 429:
+                wait = min(2 ** attempt, 20)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt == 4:
+                break
+            time.sleep(min(2 ** attempt, 20))
+    raise last_error
 
 def _is_nepse_holiday(dt):
     """NEPSE trades Sun–Thu. Fri (4) and Sat (5) are holidays."""
@@ -219,14 +265,47 @@ def _save_rows(rows):
         if not rows:
             return 0
 
+    normalized_rows = []
+    seen = set()
+    for row in rows:
+        row = tuple(row)
+        if len(row) == 8:
+            row = row + (None, None, None, None)
+        elif len(row) < 12:
+            row = row + (None,) * (12 - len(row))
+        else:
+            row = row[:12]
+
+        dedupe_key = (
+            row[0],
+            row[1],
+            row[8] if row[8] not in (None, "") else None,
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[9],
+            row[10],
+            row[11],
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized_rows.append(row)
+
+    if not normalized_rows:
+        return 0
+
     conn = get_db()
     conn.executemany("""
         INSERT OR IGNORE INTO floor_sheet
-        (date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
+        (date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at,
+         transaction_no, source_file, page_no, row_no_in_page)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, normalized_rows)
     conn.commit()
-    n = len(rows)
+    n = len(normalized_rows)
     conn.close()
     return n
 
@@ -346,8 +425,169 @@ def prune_old_broker_summary(keep_days=None):
 # ════════════════════════════════════════════════════════════════════════════
 # METHOD 1: NEPSE Unofficial API  (today / recent, fast)
 # ════════════════════════════════════════════════════════════════════════════
+def fetch_by_date_via_sharehub(date_str_ymd, return_status=False, page_size=500):
+    """Fetch full market floor sheet for one date from ShareHub."""
+    fetched_at = datetime.now().isoformat()
+    sharehub_date = date_str_ymd.replace("-0", "-").lstrip("0")
+    page_size = min(int(page_size or 100), 100)
+    if sharehub_date.startswith("0"):
+        sharehub_date = date_str_ymd
+
+    def _ret(saved, status, reason=""):
+        if return_status:
+            return saved, status, reason
+        return saved
+
+    try:
+        print(f"[ShareHub] Fetching floor sheet for {date_str_ymd}...")
+        first_payload = _http_get_json(
+            SHAREHUB_FLOORSHEET_BY_DATE_URL,
+            params={"Size": page_size, "currentPage": 1, "date": sharehub_date},
+        )
+        data = first_payload.get("data") or {}
+        first_content = data.get("content") or []
+        if not first_content:
+            return _ret(0, "no_data", "empty_sharehub_payload")
+
+        total_pages = int(data.get("totalPages") or 1)
+        rows = []
+
+        def _normalize_rows(content, page_no):
+            normalized = []
+            for row_index, row in enumerate(content, start=1):
+                symbol = str(row.get("symbol") or "").upper()
+                if not symbol:
+                    continue
+                normalized.append((
+                    date_str_ymd,
+                    symbol,
+                    _int(row.get("buyerMemberId")),
+                    _int(row.get("sellerMemberId")),
+                    _float(row.get("contractQuantity")),
+                    _float(row.get("contractRate")),
+                    _float(row.get("contractAmount")),
+                    fetched_at,
+                    str(row.get("contractId") or "").strip() or None,
+                    "sharehub",
+                    page_no,
+                    row_index,
+                ))
+            return normalized
+
+        rows.extend(_normalize_rows(first_content, 1))
+
+        def _fetch_page(page_no):
+            payload = _http_get_json(
+                SHAREHUB_FLOORSHEET_BY_DATE_URL,
+                params={"Size": page_size, "currentPage": page_no, "date": sharehub_date},
+                timeout=40,
+            )
+            return page_no, ((payload.get("data") or {}).get("content") or [])
+
+        if total_pages > 1:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(_fetch_page, page_no): page_no for page_no in range(2, total_pages + 1)}
+                for future in as_completed(futures):
+                    page_no, content = future.result()
+                    if content:
+                        rows.extend(_normalize_rows(content, page_no))
+
+        if not rows:
+            return _ret(0, "no_data", "empty_sharehub_rows")
+
+        txn_values = [row[8] for row in rows if row[8]]
+        if txn_values:
+            unique_ratio = len(set(txn_values)) / max(len(txn_values), 1)
+            if total_pages > 1 and unique_ratio < 0.9:
+                msg = f"sharehub_duplicate_pagination ratio={unique_ratio:.3f}"
+                print(f"[ShareHub] {date_str_ymd}: rejected raw floorsheet ({msg})")
+                return _ret(0, "error", msg)
+
+        saved = _save_rows(rows)
+        print(f"[ShareHub] {date_str_ymd}: {len(rows):,} trades | {saved:,} saved")
+        return _ret(saved, "saved", "sharehub_success")
+    except Exception as e:
+        print(f"[ShareHub] {date_str_ymd} ERROR: {e}")
+        return _ret(0, "error", str(e))
+
+
+def fetch_by_date_via_chukul(date_str_ymd, return_status=False, page_size=500):
+    """Fetch full market floor sheet for one date from Chukul."""
+    fetched_at = datetime.now().isoformat()
+
+    def _ret(saved, status, reason=""):
+        if return_status:
+            return saved, status, reason
+        return saved
+
+    try:
+        print(f"[Chukul] Fetching floor sheet for {date_str_ymd}...")
+        first_payload = _http_get_json(
+            CHUKUL_FLOORSHEET_BY_DATE_URL,
+            params={"date": date_str_ymd, "page": 1, "size": page_size},
+        )
+        first_content = first_payload.get("data") or []
+        if not first_content:
+            return _ret(0, "no_data", "empty_chukul_payload")
+
+        last_page = int(first_payload.get("last_page") or 1)
+        rows = []
+
+        def _normalize_rows(content, page_no):
+            normalized = []
+            for row_index, row in enumerate(content, start=1):
+                symbol = str(row.get("symbol") or "").upper()
+                if not symbol:
+                    continue
+                normalized.append((
+                    date_str_ymd,
+                    symbol,
+                    _int(row.get("buyer")),
+                    _int(row.get("seller")),
+                    _float(row.get("quantity")),
+                    _float(row.get("rate")),
+                    _float(row.get("amount")),
+                    fetched_at,
+                    str(row.get("transaction") or "").strip() or None,
+                    "chukul",
+                    page_no,
+                    row_index,
+                ))
+            return normalized
+
+        rows.extend(_normalize_rows(first_content, 1))
+
+        for page_no in range(2, last_page + 1):
+            payload = _http_get_json(
+                CHUKUL_FLOORSHEET_BY_DATE_URL,
+                params={"date": date_str_ymd, "page": page_no, "size": page_size},
+            )
+            content = payload.get("data") or []
+            if content:
+                rows.extend(_normalize_rows(content, page_no))
+            if page_no % 50 == 0 or page_no == last_page:
+                print(f"[Chukul] {date_str_ymd}: fetched page {page_no}/{last_page}")
+
+        if not rows:
+            return _ret(0, "no_data", "empty_chukul_rows")
+
+        saved = _save_rows(rows)
+        print(f"[Chukul] {date_str_ymd}: {len(rows):,} trades | {saved:,} saved")
+        return _ret(saved, "saved", "chukul_success")
+    except Exception as e:
+        print(f"[Chukul] {date_str_ymd} ERROR: {e}")
+        return _ret(0, "error", str(e))
+
+
 def fetch_today_via_api():
     """Fetch full market floor sheet for today using NepseUnofficialApi."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    saved, _, _ = fetch_by_date_via_chukul(today, return_status=True)
+    if saved:
+        return saved
+    saved, _, _ = fetch_by_date_via_sharehub(today, return_status=True)
+    if saved:
+        return saved
     try:
         from nepse import Nepse
         nepse = Nepse()
@@ -810,14 +1050,57 @@ def fetch_historical_via_merolagani(date_str_ymd, return_status=False):
         return _ret(0, "error", str(e))
 
 
+def fetch_today_price_from_sharehub():
+    """Fetch latest daily price snapshot from ShareHub live API."""
+    payload = _http_get_json(
+        SHAREHUB_TODAYS_PRICE_URL,
+        params={
+            "queryKey[0]": "todayPrice",
+            "queryKey[1][order]": "",
+            "queryKey[1][sortBy]": "",
+            "queryKey[1][searchText]": "",
+            "queryKey[1][page]": 1,
+            "queryKey[1][limit]": 500,
+            "queryKey[1][sortDirection]": "",
+        },
+        timeout=30,
+    )
+    rows = payload.get("data") or []
+    if not rows:
+        return None, []
+
+    trade_date = str(rows[0].get("businessDate") or "").strip()
+    normalized = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        normalized.append(
+            (
+                trade_date,
+                symbol,
+                _float(row.get("openPrice")),
+                _float(row.get("highPrice")),
+                _float(row.get("lowPrice")),
+                _float(row.get("ltp")),
+                _float(row.get("totalTradedQuantity")),
+                _float(row.get("totalTradedValue")),
+                _int(row.get("totalTrades")),
+                _float(row.get("averageTradedPrice")),
+                datetime.now().isoformat(),
+            )
+        )
+    return trade_date, normalized
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # OHLC V COMPUTATION
 # ════════════════════════════════════════════════════════════════════════════
 def compute_daily_price(dates=None):
     """
-    Compute Open, High, Low, Close, Volume, VWAP from floor_sheet for new dates.
-    Only processes dates not already in daily_price.
-    Note: Open/Close are naive (first/last trade in the db insertion order).
+    Compute or fetch daily OHLCV rows for new dates.
+    Latest date is sourced from ShareHub live daily-price API when available.
+    Older dates fall back to floor_sheet aggregation.
     """
     conn = get_db()
     if dates is None:
@@ -834,33 +1117,48 @@ def compute_daily_price(dates=None):
     fetched_at = datetime.now().isoformat()
     total = 0
 
+    sharehub_date = None
+    sharehub_rows = []
+    try:
+        sharehub_date, sharehub_rows = fetch_today_price_from_sharehub()
+    except Exception as e:
+        print(f"[Price] ShareHub daily-price fetch failed, using floor_sheet fallback: {e}")
+
     for d in dates:
         conn = get_db()
         try:
             # Delete any partial rows for this date first
             conn.execute("DELETE FROM daily_price WHERE date=?", (d,))
 
-            # Use sqlite window functions/group_concat to get open/close safely
-            conn.execute("""
-                INSERT INTO daily_price (
-                    date, symbol, open, high, low, close, volume, amount, trades, vwap, fetched_at
-                )
-                SELECT
-                    date,
-                    symbol,
-                    (SELECT rate FROM floor_sheet f2 WHERE f2.date=f1.date AND f2.symbol=f1.symbol ORDER BY id ASC LIMIT 1) as open,
-                    MAX(rate) as high,
-                    MIN(rate) as low,
-                    (SELECT rate FROM floor_sheet f3 WHERE f3.date=f1.date AND f3.symbol=f1.symbol ORDER BY id DESC LIMIT 1) as close,
-                    SUM(quantity) as volume,
-                    SUM(amount) as amount,
-                    COUNT(*) as trades,
-                    ROUND(SUM(amount) / NULLIF(SUM(quantity), 0), 2) as vwap,
-                    ?
-                FROM floor_sheet f1
-                WHERE date=?
-                GROUP BY date, symbol
-            """, (fetched_at, d))
+            if sharehub_date and d == sharehub_date and sharehub_rows:
+                conn.executemany("""
+                    INSERT INTO daily_price (
+                        date, symbol, open, high, low, close, volume, amount, trades, vwap, fetched_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, sharehub_rows)
+            else:
+                # Fallback for older dates from raw floor_sheet aggregation.
+                conn.execute("""
+                    INSERT INTO daily_price (
+                        date, symbol, open, high, low, close, volume, amount, trades, vwap, fetched_at
+                    )
+                    SELECT
+                        date,
+                        symbol,
+                        (SELECT rate FROM floor_sheet f2 WHERE f2.date=f1.date AND f2.symbol=f1.symbol ORDER BY id ASC LIMIT 1) as open,
+                        MAX(rate) as high,
+                        MIN(rate) as low,
+                        (SELECT rate FROM floor_sheet f3 WHERE f3.date=f1.date AND f3.symbol=f1.symbol ORDER BY id DESC LIMIT 1) as close,
+                        SUM(quantity) as volume,
+                        SUM(amount) as amount,
+                        COUNT(*) as trades,
+                        ROUND(SUM(amount) / NULLIF(SUM(quantity), 0), 2) as vwap,
+                        ?
+                    FROM floor_sheet f1
+                    WHERE date=?
+                    GROUP BY date, symbol
+                """, (fetched_at, d))
 
             conn.commit()
             n = conn.execute("SELECT COUNT(*) FROM daily_price WHERE date=?", (d,)).fetchone()[0]
@@ -967,8 +1265,8 @@ def compute_broker_summary(dates=None):
 def run_daily_update(prune_raw=True):
     """
     Called every trading day after market close (4 PM NST).
-    1. Tries NEPSE API first (fast, today only).
-    2. Falls back to Merolagani market-wide scrape if API returns nothing.
+    1. Tries Chukul by-date floorsheet first.
+    2. Falls back to ShareHub, then Merolagani if needed.
     3. Recomputes broker_summary + daily_price.
     4. Optionally prunes raw floor_sheet rows (prune_raw=True by default).
     """
@@ -981,9 +1279,15 @@ def run_daily_update(prune_raw=True):
     if today in existing:
         print(f"[Daily] {today} already in DB, recomputing broker_summary only.")
     else:
-        saved = fetch_today_via_api()
+        saved, status, _ = fetch_by_date_via_chukul(today, return_status=True)
         if not saved:
-            print("[Daily] API returned no data; falling back to Merolagani scrape...")
+            print("[Daily] Chukul daily floorsheet unavailable; trying ShareHub...")
+            saved, status, _ = fetch_by_date_via_sharehub(today, return_status=True)
+        if not saved:
+            if status == "error":
+                print("[Daily] ShareHub/Chukul fetch errored; falling back to Merolagani scrape...")
+            else:
+                print("[Daily] ShareHub/Chukul returned no data; falling back to Merolagani scrape...")
             saved = fetch_historical_via_merolagani(today)
         if not saved:
             print(f"[Daily] No floor sheet data available for {today}")
@@ -1044,7 +1348,11 @@ def run_historical_backfill(days_back=None, start_date=None, prune_raw=False):
     batch = 0
     batch_dates = []
     for i, date_str in enumerate(dates_to_fetch):
-        saved, status, reason = fetch_historical_via_merolagani(date_str, return_status=True)
+        saved, status, reason = fetch_by_date_via_chukul(date_str, return_status=True)
+        if not saved:
+            saved, status, reason = fetch_by_date_via_sharehub(date_str, return_status=True)
+        if not saved:
+            saved, status, reason = fetch_historical_via_merolagani(date_str, return_status=True)
         if status == "no_data":
             _mark_backfill_skip_date(date_str, reason)
             print(f"  [{date_str}] Marked as no-data for future runs ({reason})")

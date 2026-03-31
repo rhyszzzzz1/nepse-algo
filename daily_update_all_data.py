@@ -106,6 +106,14 @@ def main():
         fs_args.append("--prune-raw")
     run_step("Daily floorsheet + broker summary + daily price", fs_args)
 
+    run_step(
+        "Sync latest daily_price snapshot into price_history",
+        [
+            "-c",
+            "from src.data.fetcher import sync_daily_price_into_price_history; print(sync_daily_price_into_price_history())",
+        ],
+    )
+
     if not args.skip_news_dividend:
         run_step(
             "Company metadata + news + dividend refresh",
