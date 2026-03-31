@@ -244,79 +244,34 @@ def calculate_broker_summary(symbol, date=None):
 # ── FETCH SECTOR INDICES ──────────────────────────────────────────────────────
 def fetch_sector_indices():
     """
-    Fetch all NEPSE sub-index (sector) values via getNepseSubIndices().
-    Handles list and dict return types.
-    Returns a DataFrame of the sector data.
+    Fetch sector indices from ShareHub historical index API.
+    Returns a DataFrame of the latest sector data.
     """
     print("Fetching sector indices...")
-    nepse = get_nepse()
-    conn = get_db()
-
     try:
-        data = nepse.getNepseSubIndices()
-
-        # Normalise to DataFrame
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            df = pd.DataFrame()
-            for key, val in data.items():
-                if isinstance(val, list) and len(val) > 0:
-                    df = pd.DataFrame(val)
-                    break
-            if df.empty:
-                # dict itself may be the single record
-                df = pd.DataFrame([data])
-        else:
-            print(f"   Unexpected data type: {type(data)}")
-            return pd.DataFrame()
-
-        if df.empty:
-            print("   No sector index data returned")
-            return df
-
-        print(f"   Got {len(df)} sector entries")
-        print(f"   Columns: {list(df.columns)}")
-
-        fetched_at = datetime.now().isoformat()
-        today      = datetime.now().strftime("%Y-%m-%d")
-        saved      = 0
-
-        for _, row in df.iterrows():
+        try:
+            from fetcher import fetch_sharehub_index_history
+        except ImportError:
             try:
-                # Try several possible column names for sector label
-                sector = (
-                    row.get('index') or
-                    row.get('name') or
-                    row.get('sectorName') or
-                    row.get('indexName') or
-                    'Unknown'
-                )
-                # Try several possible column names for numeric value
-                value = (
-                    row.get('currentValue') or
-                    row.get('close') or
-                    row.get('value') or
-                    0
-                )
-                conn.execute("""
-                    INSERT OR REPLACE INTO sector_index (date, sector, value, fetched_at)
-                    VALUES (?, ?, ?, ?)
-                """, (today, str(sector), float(value or 0), fetched_at))
-                saved += 1
-            except Exception as e:
-                print(f"   Skipped sector row: {e}")
-
-        conn.commit()
-        print(f"[OK] Saved {saved} sector index entries")
+                from data.fetcher import fetch_sharehub_index_history
+            except ImportError:
+                from src.data.fetcher import fetch_sharehub_index_history
+        latest = fetch_sharehub_index_history()
+        conn = get_db()
+        latest_date = latest["date"] if latest else datetime.now().strftime("%Y-%m-%d")
+        df = pd.read_sql_query(
+            "SELECT sector, value, date FROM sector_index WHERE date = ? ORDER BY sector",
+            conn,
+            params=(latest_date,),
+        )
+        conn.close()
+        print(f"[OK] Loaded {len(df)} sector index entries for {latest_date}")
         return df
 
     except Exception as e:
         print(f"[ERR] Error fetching sector indices: {e}")
         traceback.print_exc()
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 # ── FETCH SUPPLY & DEMAND ─────────────────────────────────────────────────────

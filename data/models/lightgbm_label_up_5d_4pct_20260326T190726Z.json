@@ -1,0 +1,164 @@
+{
+  "target": "label_up_5d_4pct",
+  "threshold": 0.55,
+  "feature_count": 62,
+  "training_rows": 211627,
+  "validation_rows": 62202,
+  "train_start": "2022-01-25",
+  "train_end": "2025-05-11",
+  "validation_start": "2025-05-13",
+  "validation_end": "2026-03-26",
+  "train_metrics": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "accuracy": 1.0,
+    "positive_rate": 0.19071763054808696,
+    "mean_probability": 0.19072636387895323
+  },
+  "validation_metrics": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "accuracy": 1.0,
+    "positive_rate": 0.15411080029581042,
+    "mean_probability": 0.15412126955474068
+  },
+  "top_features": [
+    {
+      "feature": "sector_strength_rank_pct",
+      "importance": 515
+    },
+    {
+      "feature": "label_up_5d_4pct",
+      "importance": 337
+    },
+    {
+      "feature": "close",
+      "importance": 186
+    },
+    {
+      "feature": "bb_pct",
+      "importance": 151
+    },
+    {
+      "feature": "macd_hist",
+      "importance": 111
+    },
+    {
+      "feature": "score_ma_10",
+      "importance": 88
+    },
+    {
+      "feature": "rsi_delta_3d",
+      "importance": 83
+    },
+    {
+      "feature": "score_ma_5",
+      "importance": 80
+    },
+    {
+      "feature": "volatility_20d",
+      "importance": 76
+    },
+    {
+      "feature": "close_vs_20d_high_pct",
+      "importance": 71
+    },
+    {
+      "feature": "broker_top5_buy_amount_share",
+      "importance": 70
+    },
+    {
+      "feature": "broker_avg_trade_size",
+      "importance": 64
+    },
+    {
+      "feature": "dump_score",
+      "importance": 62
+    },
+    {
+      "feature": "change_pct",
+      "importance": 61
+    },
+    {
+      "feature": "ret_5d",
+      "importance": 59
+    },
+    {
+      "feature": "ret_20d",
+      "importance": 58
+    },
+    {
+      "feature": "pump_score",
+      "importance": 54
+    },
+    {
+      "feature": "atr14",
+      "importance": 49
+    },
+    {
+      "feature": "ret_3d",
+      "importance": 46
+    },
+    {
+      "feature": "turnover",
+      "importance": 44
+    },
+    {
+      "feature": "volume_ratio_5_20",
+      "importance": 41
+    },
+    {
+      "feature": "broker_active_count",
+      "importance": 40
+    },
+    {
+      "feature": "close_vs_20d_low_pct",
+      "importance": 34
+    },
+    {
+      "feature": "broker_top3_buy_amount_share",
+      "importance": 34
+    },
+    {
+      "feature": "volume_ratio",
+      "importance": 34
+    }
+  ],
+  "walk_forward": [
+    {
+      "train_end": "2022-11-09",
+      "test_start": "2022-11-10",
+      "test_end": "2023-08-30",
+      "sample_count": 50077,
+      "positive_rate": 0.18425624538211155,
+      "precision": 1.0,
+      "recall": 1.0,
+      "accuracy": 1.0,
+      "mean_probability": 0.184257172047942
+    },
+    {
+      "train_end": "2023-08-30",
+      "test_start": "2023-09-03",
+      "test_end": "2024-07-08",
+      "sample_count": 57826,
+      "positive_rate": 0.21661536333137343,
+      "precision": 1.0,
+      "recall": 1.0,
+      "accuracy": 1.0,
+      "mean_probability": 0.21662032672902223
+    },
+    {
+      "train_end": "2024-07-08",
+      "test_start": "2024-07-09",
+      "test_end": "2025-05-11",
+      "sample_count": 60466,
+      "positive_rate": 0.20317203056263025,
+      "precision": 1.0,
+      "recall": 1.0,
+      "accuracy": 1.0,
+      "mean_probability": 0.20317673455996188
+    }
+  ],
+  "model_path": "C:\\nepse-algo\\data\\models\\lightgbm_label_up_5d_4pct_20260326T190726Z.pkl",
+  "importance_path": "C:\\nepse-algo\\data\\models\\lightgbm_label_up_5d_4pct_20260326T190726Z_feature_importance.csv"
+}

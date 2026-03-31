@@ -74,7 +74,24 @@ COMPANY_LIST_URL = f"{BASE_URL}/CompanyList.aspx"
 COMPANY_DETAIL_URL = f"{BASE_URL}/CompanyDetail.aspx"
 SHARESANSAR_BASE_URL = "https://www.sharesansar.com"
 SHAREHUB_PRICE_HISTORY_URL = "https://sharehubnepal.com/data/api/v1/price-history"
+SHAREHUB_INDEX_HISTORY_URL = "https://sharehubnepal.com/data/api/v1/index/date-wise-data"
+SHAREHUB_TODAYS_PRICE_URL = "https://sharehubnepal.com/live/api/v2/nepselive/todays-price"
 CHUKUL_MARKET_SUMMARY_URL = "https://chukul.com/api/data/v2/market-summary/"
+CHUKUL_FLOORSHEET_BY_DATE_URL = "https://chukul.com/api/data/v2/floorsheet/bydate/"
+
+SHAREHUB_INDEX_ID_MAP = {
+    1: "NEPSE",
+    2: "Float Index",
+    3: "Sensitive Index",
+    4: "Sensitive Float Index",
+    5: "Banking SubIndex",
+    6: "Hotels And Tourism Index",
+    7: "Others Index",
+    8: "HydroPower Index",
+    9: "Development Bank Index",
+    10: "Manufacturing And Processing",
+    11: "Non Life Insurance",
+}
 
 # Delay between requests (seconds) — randomised to be polite
 MIN_DELAY = 0.4
@@ -508,6 +525,150 @@ def _fetch_price_history_from_sharehub(symbol, page_size=500, start_date=None, e
 
     return df.reset_index(drop=True)
 
+
+def fetch_sharehub_index_history(index_ids=None, page_size=500):
+    """
+    Fetch historical index series from ShareHub and persist them into sector_index.
+    Also updates market_summary from the latest NEPSE row.
+    """
+    if index_ids is None:
+        index_ids = sorted(SHAREHUB_INDEX_ID_MAP.keys())
+
+    print("Fetching index history from ShareHub...")
+    fetched_at = datetime.now().isoformat()
+    conn = get_db()
+
+    try:
+        ensure_sector_index_table(conn)
+        latest_nepse_row = None
+        total_saved = 0
+
+        for index_id in index_ids:
+            sector_name = SHAREHUB_INDEX_ID_MAP.get(index_id, f"Index {index_id}")
+            page = 1
+            while True:
+                resp = SESSION.get(
+                    SHAREHUB_INDEX_HISTORY_URL,
+                    params={"indexId": index_id, "page": page, "size": page_size},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                payload = resp.json().get("data") or {}
+                rows = payload.get("content") or []
+                if not rows:
+                    break
+
+                for row in rows:
+                    date_value = str(row.get("date") or "").strip()
+                    if not date_value:
+                        continue
+
+                    close_value = float(row.get("close") or 0)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO sector_index (date, sector, value, fetched_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (date_value, sector_name, close_value, fetched_at),
+                    )
+                    total_saved += 1
+
+                    if index_id == 1:
+                        candidate = {
+                            "date": date_value,
+                            "close": close_value,
+                            "turnover": float(row.get("turnover") or 0),
+                            "volume": float(row.get("volume") or 0),
+                        }
+                        if latest_nepse_row is None or candidate["date"] > latest_nepse_row["date"]:
+                            latest_nepse_row = candidate
+
+                total_pages = int(payload.get("totalPages") or 1)
+                if page >= total_pages:
+                    break
+                page += 1
+                time.sleep(random.uniform(0.1, 0.25))
+
+        if latest_nepse_row is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO market_summary
+                (date, nepse_index, total_turnover, total_volume, fetched_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    latest_nepse_row["date"],
+                    latest_nepse_row["close"],
+                    latest_nepse_row["turnover"],
+                    latest_nepse_row["volume"],
+                    fetched_at,
+                ),
+            )
+
+        conn.commit()
+        print(f"[OK] Saved {total_saved} ShareHub index-history rows")
+        return latest_nepse_row
+    finally:
+        conn.close()
+
+
+def sync_daily_price_into_price_history(target_date=None):
+    """
+    Backfill the latest daily OHLCV snapshot into price_history.
+
+    Why this exists:
+    - ShareHub's symbol-level historical price-history endpoint can lag the
+      newest market day.
+    - The latest-day snapshot in daily_price is often more complete.
+    - Cleaner/signals read from price_history, so we upsert daily_price rows
+      into price_history to avoid incomplete latest-date coverage.
+
+    Returns a dict with the synced date and row count.
+    """
+    conn = get_db()
+    try:
+        if target_date is None:
+            row = conn.execute("SELECT MAX(date) FROM daily_price").fetchone()
+            target_date = row[0] if row else None
+
+        if not target_date:
+            return {"date": None, "row_count": 0}
+
+        fetched_at = datetime.now().isoformat()
+        conn.execute(
+            """
+            INSERT INTO price_history (symbol, date, open, high, low, close, volume, fetched_at)
+            SELECT
+                symbol,
+                date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                ?
+            FROM daily_price
+            WHERE date = ?
+            ON CONFLICT(symbol, date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume,
+                fetched_at = excluded.fetched_at
+            """,
+            (fetched_at, target_date),
+        )
+        conn.commit()
+        row_count = conn.execute(
+            "SELECT COUNT(DISTINCT symbol) FROM price_history WHERE date = ?",
+            (target_date,),
+        ).fetchone()[0]
+        print(f"[OK] Synced {row_count} daily_price rows into price_history for {target_date}")
+        return {"date": target_date, "row_count": row_count}
+    finally:
+        conn.close()
+
 # ── CREATE TABLES ──────────────────────────────────────────────────────────────
 def create_tables():
     """Create all database tables if they don't exist."""
@@ -850,8 +1011,8 @@ FLOORSHEET_HANDLER = f"{BASE_URL}/handlers/NewFloorSheetHandler.ashx"
 
 def fetch_floor_sheet_for(symbol):
     """
-    Fetch today's floor sheet (broker trades) for a symbol from Merolagani.
-    Paginates through all pages automatically.
+    Fetch latest date's floor sheet (broker trades) for a symbol from Chukul.
+    Falls back to Merolagani only if needed.
     Saves to floor_sheet table. Returns a DataFrame.
     """
     print(f"Fetching floor sheet for {symbol}...")
@@ -859,33 +1020,32 @@ def fetch_floor_sheet_for(symbol):
     page = 1
 
     try:
+        latest_summary = fetch_market_summary() or {}
+        target_date = latest_summary.get("date") or datetime.now().strftime("%Y-%m-%d")
+        fetched_at = datetime.now().isoformat()
+
         while True:
-            params = {"type": "floorsheet", "symbol": symbol, "page": page}
-            resp = _get(FLOORSHEET_HANDLER, params=params)
-            data = resp.json()
-
-            content = (
-                data.get("floorsheets", {})
-                    .get("content", [])
+            resp = SESSION.get(
+                CHUKUL_FLOORSHEET_BY_DATE_URL,
+                params={"date": target_date, "page": page, "size": 500},
+                timeout=30,
             )
-            if not content:
-                break
-
+            resp.raise_for_status()
+            data = resp.json()
+            content = [row for row in (data.get("data") or []) if str(row.get("symbol", "")).upper() == symbol.upper()]
             all_rows.extend(content)
-            total_pages = data.get("floorsheets", {}).get("totalPages", 1)
+            total_pages = int(data.get("last_page") or 1)
             if page >= total_pages:
                 break
             page += 1
 
         if not all_rows:
-            print(f"   No floor sheet trades for {symbol} today")
+            print(f"   No floor sheet trades for {symbol} on {target_date}")
             return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
         print(f"   Got {len(df)} trades across {page} page(s)")
 
-        fetched_at = datetime.now().isoformat()
-        today      = datetime.now().strftime("%Y-%m-%d")
         conn = get_db()
 
         for _, row in df.iterrows():
@@ -895,13 +1055,13 @@ def fetch_floor_sheet_for(symbol):
                     (date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    today,
+                    target_date,
                     symbol,
-                    int(row.get("buyerBrokerNo",  0) or 0),
-                    int(row.get("sellerBrokerNo", 0) or 0),
-                    float(row.get("contractQuantity", 0) or 0),
-                    float(row.get("contractRate",     0) or 0),
-                    float(row.get("contractAmount",   0) or 0),
+                    int(row.get("buyer",  0) or 0),
+                    int(row.get("seller", 0) or 0),
+                    float(row.get("quantity", 0) or 0),
+                    float(row.get("rate",     0) or 0),
+                    float(row.get("amount",   0) or 0),
                     fetched_at,
                 ))
             except Exception as e:
@@ -941,7 +1101,21 @@ def fetch_market_summary():
     try:
         ensure_sector_index_table(conn)
 
-        # Method 0: Chukul market-summary index feed (preferred)
+        # Method 0: ShareHub index-history feed (preferred)
+        try:
+            latest_nepse_row = fetch_sharehub_index_history()
+            if latest_nepse_row:
+                print(f"[OK] Market summary saved from ShareHub for {latest_nepse_row['date']}")
+                return {
+                    "date": latest_nepse_row["date"],
+                    "nepse_index": latest_nepse_row["close"],
+                    "total_turnover": latest_nepse_row["turnover"],
+                    "total_volume": latest_nepse_row["volume"],
+                }
+        except Exception as sharehub_err:
+            print(f"   ShareHub index history failed, falling back to Chukul: {sharehub_err}")
+
+        # Method 1: Chukul market-summary index feed
         try:
             resp = SESSION.get(CHUKUL_MARKET_SUMMARY_URL, params={"type": "index"}, timeout=20)
             resp.raise_for_status()
