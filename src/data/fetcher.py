@@ -53,6 +53,112 @@ def ensure_sector_index_table(conn):
         )
     """)
 
+
+def ensure_sector_cap_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sector_cap_stocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fetched_date TEXT NOT NULL,
+            sector_code TEXT NOT NULL,
+            sector_name TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            public_shares REAL,
+            promoter_shares REAL,
+            fiscal_year TEXT,
+            quarter TEXT,
+            eps REAL,
+            net_worth REAL,
+            close REAL,
+            pe_ratio REAL,
+            gram_value REAL,
+            net_profit REAL,
+            prev_quarter_profit REAL,
+            growth_rate REAL,
+            discount_rate REAL,
+            paidup_capital REAL,
+            fetched_at TEXT,
+            UNIQUE(fetched_date, sector_code, symbol)
+        )
+    """)
+
+
+def ensure_sharehub_announcements_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sharehub_announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            announcement_id INTEGER NOT NULL,
+            title TEXT,
+            symbol TEXT,
+            security_name TEXT,
+            icon_url TEXT,
+            subtitle TEXT,
+            details TEXT,
+            announcement_date TEXT,
+            attachment_url TEXT,
+            news_url TEXT,
+            is_event INTEGER,
+            event_date TEXT,
+            source TEXT,
+            category TEXT,
+            type TEXT,
+            time_ms INTEGER,
+            page_index INTEGER,
+            fetched_at TEXT,
+            UNIQUE(announcement_id)
+        )
+    """)
+
+
+def ensure_sharehub_news_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sharehub_news_feed (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            slug TEXT,
+            profile_name TEXT,
+            profile_image_url TEXT,
+            user_name TEXT,
+            is_profile_verified INTEGER,
+            title TEXT,
+            summary TEXT,
+            reaction_count INTEGER,
+            comment_count INTEGER,
+            share_count INTEGER,
+            media_type TEXT,
+            media_url TEXT,
+            launch_url TEXT,
+            is_promoted INTEGER,
+            time_ago TEXT,
+            published_date TEXT,
+            page_index INTEGER,
+            fetched_at TEXT,
+            UNIQUE(post_id)
+        )
+    """)
+
+
+def ensure_sharehub_public_offerings_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sharehub_public_offerings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            detail_slug TEXT NOT NULL,
+            page_index INTEGER,
+            symbol TEXT,
+            short_code TEXT,
+            company_name TEXT,
+            ratio TEXT,
+            units TEXT,
+            price TEXT,
+            opening_date TEXT,
+            closing_date TEXT,
+            status TEXT,
+            detail_url TEXT,
+            offering_type TEXT,
+            fetched_at TEXT,
+            UNIQUE(detail_slug)
+        )
+    """)
+
 # ── HTTP SESSION ───────────────────────────────────────────────────────────────
 # Merolagani is tolerant of scrapers but we add realistic headers + small delays
 # to be polite and avoid getting throttled during bulk fetches.
@@ -75,9 +181,13 @@ COMPANY_DETAIL_URL = f"{BASE_URL}/CompanyDetail.aspx"
 SHARESANSAR_BASE_URL = "https://www.sharesansar.com"
 SHAREHUB_PRICE_HISTORY_URL = "https://sharehubnepal.com/data/api/v1/price-history"
 SHAREHUB_INDEX_HISTORY_URL = "https://sharehubnepal.com/data/api/v1/index/date-wise-data"
+SHAREHUB_INDEX_ANALYSIS_URL = "https://sharehubnepal.com/data/api/v1/index/date-wise-analysis"
+SHAREHUB_ANNOUNCEMENT_URL = "https://sharehubnepal.com/data/api/v1/announcement"
+SHAREHUB_KHULA_MANCH_URL = "https://sharehubnepal.com/account/api/v1/khula-manch/post"
 SHAREHUB_TODAYS_PRICE_URL = "https://sharehubnepal.com/live/api/v2/nepselive/todays-price"
 CHUKUL_MARKET_SUMMARY_URL = "https://chukul.com/api/data/v2/market-summary/"
 CHUKUL_FLOORSHEET_BY_DATE_URL = "https://chukul.com/api/data/v2/floorsheet/bydate/"
+CHUKUL_SECTOR_LOW_CAP_URL = "https://chukul.com/api/sector/low-cap/"
 
 SHAREHUB_INDEX_ID_MAP = {
     1: "NEPSE",
@@ -91,6 +201,21 @@ SHAREHUB_INDEX_ID_MAP = {
     9: "Development Bank Index",
     10: "Manufacturing And Processing",
     11: "Non Life Insurance",
+}
+
+CHUKUL_SECTOR_CODE_MAP = {
+    "BANKING": "Banking",
+    "DEVBANK": "Development Bank",
+    "FINANCE": "Finance",
+    "HOTELS": "Hotels And Tourism",
+    "HYDRO": "Hydro Power",
+    "INVESTMENT": "Investment",
+    "LIFEINSU": "Life Insurance",
+    "MANUFACTURE": "Manufacturing And Processing",
+    "MICROFINANCE": "Microfinance",
+    "NONLIFEINSU": "Non Life Insurance",
+    "OTHERS": "Others",
+    "TRDIND": "Trading",
 }
 
 # Delay between requests (seconds) — randomised to be polite
@@ -467,14 +592,14 @@ def _fetch_price_history_from_sharesansar(symbol):
 
 def _fetch_price_history_from_sharehub(symbol, page_size=500, start_date=None, end_date=None):
     print(f"   Fetching from ShareHub price history for {symbol}...")
-    page = 1
+    page = 0
     frames = []
 
     while True:
         params = {
-            "symbol": symbol.upper(),
-            "pageIndex": page,
-            "pageSize": page_size,
+            "symbol": symbol.lower(),
+            "currentPage": page,
+            "size": page_size,
         }
         resp = SESSION.get(SHAREHUB_PRICE_HISTORY_URL, params=params, timeout=30)
         resp.raise_for_status()
@@ -503,7 +628,7 @@ def _fetch_price_history_from_sharehub(symbol, page_size=500, start_date=None, e
             frames.append(frame)
 
         total_pages = int(payload.get("totalPages") or 1)
-        if page >= total_pages:
+        if page >= max(total_pages - 1, 0):
             break
         page += 1
         time.sleep(random.uniform(0.1, 0.25))
@@ -608,6 +733,472 @@ def fetch_sharehub_index_history(index_ids=None, page_size=500):
         conn.commit()
         print(f"[OK] Saved {total_saved} ShareHub index-history rows")
         return latest_nepse_row
+    finally:
+        conn.close()
+
+
+def fetch_sharehub_index_analysis_for_date(target_date: str):
+    """
+    Fetch all index values for a single date from ShareHub's faster
+    date-wise-analysis endpoint and persist both market_summary and sector_index.
+    """
+    print(f"Fetching ShareHub index analysis for {target_date}...")
+    fetched_at = datetime.now().isoformat()
+    conn = get_db()
+
+    try:
+        ensure_sector_index_table(conn)
+        resp = SESSION.get(
+            SHAREHUB_INDEX_ANALYSIS_URL,
+            params={"date": target_date},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json().get("data") or {}
+        rows = payload.get("content") if isinstance(payload, dict) else payload
+        if not rows:
+            return None
+
+        conn.execute("DELETE FROM sector_index WHERE date = ?", (target_date,))
+        latest_nepse_row = None
+
+        symbol_to_sector = {
+            "NEPSE": "NEPSE",
+            "FLOAT": "Float Index",
+            "SENSITIVE": "Sensitive Index",
+            "SENFLOAT": "Sensitive Float Index",
+            "BANKING": "Banking SubIndex",
+            "HOTELS": "Hotels And Tourism Index",
+            "OTHERS": "Others Index",
+            "HYDROPOWER": "HydroPower Index",
+            "DEVBANK": "Development Bank Index",
+            "MANUFACTURE": "Manufacturing And Processing",
+            "NONLIFEINSU": "Non Life Insurance",
+        }
+
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            sector_name = symbol_to_sector.get(symbol, str(row.get("name") or symbol).strip())
+            close_value = float(row.get("close") or 0)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sector_index (date, sector, value, fetched_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (target_date, sector_name, close_value, fetched_at),
+            )
+            if symbol == "NEPSE":
+                latest_nepse_row = {
+                    "date": target_date,
+                    "close": close_value,
+                    "turnover": float(row.get("turnover") or row.get("amount") or 0),
+                    "volume": float(row.get("volume") or 0),
+                }
+
+        if latest_nepse_row is not None:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO market_summary
+                (date, nepse_index, total_turnover, total_volume, fetched_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    target_date,
+                    latest_nepse_row["close"],
+                    latest_nepse_row["turnover"],
+                    latest_nepse_row["volume"],
+                    fetched_at,
+                ),
+            )
+        conn.commit()
+        return latest_nepse_row
+    finally:
+        conn.close()
+
+
+def fetch_sharehub_announcements(page_size=500):
+    """
+    Fetch the full paginated ShareHub announcements feed and persist it locally.
+    """
+    print("Fetching ShareHub announcements...")
+    fetched_at = datetime.now().isoformat()
+    conn = get_db()
+
+    try:
+        ensure_sharehub_announcements_table(conn)
+        page = 1
+        total_saved = 0
+        total_pages = None
+        total_items = 0
+
+        while True:
+            resp = SESSION.get(
+                SHAREHUB_ANNOUNCEMENT_URL,
+                params={"Size": page_size, "Page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json().get("data") or {}
+            rows = payload.get("content") or []
+
+            if total_pages is None:
+                total_pages = int(payload.get("totalPages") or 1)
+                total_items = int(payload.get("totalItems") or 0)
+                print(f"   total_pages={total_pages} total_items={total_items}")
+
+            if not rows:
+                break
+
+            page_saved = 0
+            for row in rows:
+                announcement_id = row.get("id")
+                if announcement_id is None:
+                    continue
+
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sharehub_announcements (
+                        announcement_id, title, symbol, security_name, icon_url,
+                        subtitle, details, announcement_date, attachment_url,
+                        news_url, is_event, event_date, source, category, type,
+                        time_ms, page_index, fetched_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(announcement_id),
+                        row.get("title"),
+                        row.get("symbol"),
+                        row.get("securityName"),
+                        row.get("iconUrl"),
+                        row.get("subTitle"),
+                        row.get("details"),
+                        row.get("announcementDate"),
+                        row.get("attachmentUrl"),
+                        row.get("newsUrl"),
+                        1 if row.get("isEvent") else 0,
+                        row.get("eventDate"),
+                        row.get("source"),
+                        row.get("category"),
+                        row.get("type"),
+                        int(row.get("time") or 0),
+                        int(page),
+                        fetched_at,
+                    ),
+                )
+                page_saved += 1
+
+            conn.commit()
+            total_saved += page_saved
+            print(f"   page {page}/{total_pages or '?'} saved={page_saved}")
+
+            if total_pages is not None and page >= total_pages:
+                break
+
+            page += 1
+            time.sleep(random.uniform(0.1, 0.25))
+
+        print(f"[OK] Saved {total_saved} ShareHub announcement rows")
+        return {
+            "total_saved": total_saved,
+            "total_pages": total_pages or 0,
+            "total_items": total_items,
+        }
+    finally:
+        conn.close()
+
+
+def fetch_sharehub_news_feed(media_type="News", page_size=500):
+    """
+    Fetch the full paginated ShareHub khula-manch feed for a media type.
+    """
+    print(f"Fetching ShareHub khula-manch feed ({media_type})...")
+    fetched_at = datetime.now().isoformat()
+    conn = get_db()
+
+    try:
+        ensure_sharehub_news_table(conn)
+        page = 1
+        total_saved = 0
+        total_pages = None
+        total_items = 0
+
+        while True:
+            resp = SESSION.get(
+                SHAREHUB_KHULA_MANCH_URL,
+                params={"MediaType": media_type, "Size": page_size, "page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = payload.get("data") or []
+
+            if total_pages is None:
+                total_pages = int(payload.get("totalPages") or 1)
+                total_items = int(payload.get("totalItems") or 0)
+                print(f"   total_pages={total_pages} total_items={total_items}")
+
+            if not rows:
+                break
+
+            page_saved = 0
+            for row in rows:
+                post_id = row.get("id")
+                if post_id is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sharehub_news_feed (
+                        post_id, slug, profile_name, profile_image_url, user_name,
+                        is_profile_verified, title, summary, reaction_count,
+                        comment_count, share_count, media_type, media_url,
+                        launch_url, is_promoted, time_ago, published_date,
+                        page_index, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(post_id),
+                        row.get("slug"),
+                        row.get("profileName"),
+                        row.get("profileImageUrl"),
+                        row.get("userName"),
+                        1 if row.get("isProfileVerified") else 0,
+                        row.get("title"),
+                        row.get("summary"),
+                        int(row.get("reactionCount") or 0),
+                        int(row.get("commentCount") or 0),
+                        int(row.get("shareCount") or 0),
+                        row.get("mediaType"),
+                        row.get("mediaUrl"),
+                        row.get("launchUrl"),
+                        1 if row.get("isPromoted") else 0,
+                        row.get("timeAgo"),
+                        row.get("publishedDate"),
+                        int(page),
+                        fetched_at,
+                    ),
+                )
+                page_saved += 1
+
+            conn.commit()
+            total_saved += page_saved
+            print(f"   page {page}/{total_pages or '?'} saved={page_saved}")
+
+            if total_pages is not None and page >= total_pages:
+                break
+            page += 1
+            time.sleep(random.uniform(0.1, 0.25))
+
+        print(f"[OK] Saved {total_saved} ShareHub news rows")
+        return {
+            "media_type": media_type,
+            "total_saved": total_saved,
+            "total_pages": total_pages or 0,
+            "total_items": total_items,
+        }
+    finally:
+        conn.close()
+
+
+def _infer_offering_type(detail_slug):
+    slug = (detail_slug or "").lower()
+    if "right-share" in slug:
+        return "Right Share"
+    if "fpo" in slug:
+        return "FPO"
+    if "debenture" in slug:
+        return "Debenture"
+    if "mutual-fund" in slug or "mutual" in slug:
+        return "Mutual Fund"
+    if "preference-share" in slug:
+        return "Preference Share"
+    if "ipo" in slug:
+        return "IPO"
+    return "Unknown"
+
+
+def fetch_sharehub_public_offerings(page_size=400):
+    """
+    Scrape the server-rendered ShareHub upcoming/existing public offerings pages.
+    """
+    print("Fetching ShareHub public offerings...")
+    fetched_at = datetime.now().isoformat()
+    conn = get_db()
+
+    try:
+        ensure_sharehub_public_offerings_table(conn)
+        page = 1
+        total_saved = 0
+        total_pages = None
+        empty_streak = 0
+
+        while True:
+            resp = _get(
+                "https://sharehubnepal.com/investment/upcoming-public-offerings",
+                params={"page": page, "size": page_size},
+            )
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table")
+            if table is None:
+                if page == 1:
+                    raise RuntimeError("ShareHub public offerings table not found")
+                break
+
+            rows = table.find_all("tr")
+            if len(rows) <= 1:
+                break
+
+            page_saved = 0
+            for tr in rows[1:]:
+                cells = tr.find_all("td")
+                if len(cells) < 8:
+                    continue
+                anchor = cells[0].find("a", href=True)
+                if not anchor:
+                    continue
+                detail_url = anchor["href"]
+                detail_slug = detail_url.rstrip("/").split("/")[-1]
+                short_parts = cells[0].get_text(" ", strip=True).split()
+                short_code = short_parts[0] if short_parts else None
+                symbol = short_parts[-1] if short_parts else None
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sharehub_public_offerings (
+                        detail_slug, page_index, symbol, short_code, company_name,
+                        ratio, units, price, opening_date, closing_date, status,
+                        detail_url, offering_type, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        detail_slug,
+                        int(page),
+                        symbol,
+                        short_code,
+                        cells[1].get_text(" ", strip=True),
+                        cells[2].get_text(" ", strip=True),
+                        cells[3].get_text(" ", strip=True),
+                        cells[4].get_text(" ", strip=True),
+                        cells[5].get_text(" ", strip=True),
+                        cells[6].get_text(" ", strip=True),
+                        cells[7].get_text(" ", strip=True),
+                        detail_url,
+                        _infer_offering_type(detail_slug),
+                        fetched_at,
+                    ),
+                )
+                page_saved += 1
+
+            conn.commit()
+            total_saved += page_saved
+            print(f"   page {page} saved={page_saved}")
+
+            if page_saved == 0:
+                empty_streak += 1
+            else:
+                empty_streak = 0
+
+            pagination_text = " ".join(soup.stripped_strings)
+            if total_pages is None:
+                marker = re.search(r"More pages\s+(\d+)", pagination_text)
+                if marker:
+                    total_pages = int(marker.group(1))
+                else:
+                    nums = [int(x) for x in re.findall(r"\b\d+\b", pagination_text)]
+                    total_pages = max(nums) if nums else page
+
+            if empty_streak >= 1:
+                break
+
+            if page >= (total_pages or page):
+                break
+            page += 1
+            time.sleep(random.uniform(0.1, 0.25))
+
+        print(f"[OK] Saved {total_saved} ShareHub public offering rows")
+        return {
+            "total_saved": total_saved,
+            "total_pages": total_pages or 0,
+        }
+    finally:
+        conn.close()
+
+
+def fetch_chukul_sector_low_cap():
+    """
+    Fetch Chukul sector-wise market-cap/fundamental stock buckets and persist them.
+    """
+    print("Fetching Chukul sector-wise cap data...")
+    fetched_at = datetime.now().isoformat()
+    fetched_date = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db()
+
+    try:
+        ensure_sector_cap_table(conn)
+        resp = SESSION.get(CHUKUL_SECTOR_LOW_CAP_URL, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, dict) or not payload:
+            print("[WARN] Chukul sector cap payload empty")
+            return {"fetched_date": fetched_date, "sector_count": 0, "row_count": 0}
+
+        conn.execute("DELETE FROM sector_cap_stocks WHERE fetched_date = ?", (fetched_date,))
+        row_count = 0
+        sector_count = 0
+
+        for sector_code, rows in payload.items():
+            if not isinstance(rows, list):
+                continue
+            sector_name = CHUKUL_SECTOR_CODE_MAP.get(str(sector_code).strip().upper(), str(sector_code).strip())
+            sector_count += 1
+            for row in rows:
+                symbol = str((row or {}).get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sector_cap_stocks (
+                        fetched_date, sector_code, sector_name, symbol,
+                        public_shares, promoter_shares, fiscal_year, quarter,
+                        eps, net_worth, close, pe_ratio, gram_value,
+                        net_profit, prev_quarter_profit, growth_rate,
+                        discount_rate, paidup_capital, fetched_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        fetched_date,
+                        str(sector_code).strip().upper(),
+                        sector_name,
+                        symbol,
+                        float(row.get("public_shares") or 0),
+                        float(row.get("promoter_shares") or 0),
+                        str(row.get("fiscal_year") or "").strip(),
+                        str(row.get("quarter") or "").strip(),
+                        float(row.get("eps") or 0),
+                        float(row.get("net_worth") or 0),
+                        float(row.get("close") or 0),
+                        float(row.get("pe_ratio") or 0),
+                        float(row.get("gram_value") or 0),
+                        float(row.get("net_profit") or 0),
+                        float(row.get("prev_quarter_profit") or 0),
+                        float(row.get("growth_rate") or 0),
+                        float(row.get("discount_rate") or 0),
+                        float(row.get("paidup_capital") or 0),
+                        fetched_at,
+                    ),
+                )
+                row_count += 1
+
+        conn.commit()
+        print(f"[OK] Saved {row_count} Chukul sector-cap rows across {sector_count} sectors")
+        return {
+            "fetched_date": fetched_date,
+            "sector_count": sector_count,
+            "row_count": row_count,
+        }
     finally:
         conn.close()
 
@@ -728,6 +1319,10 @@ def create_tables():
     """)
 
     ensure_sector_index_table(conn)
+    ensure_sector_cap_table(conn)
+    ensure_sharehub_announcements_table(conn)
+    ensure_sharehub_news_table(conn)
+    ensure_sharehub_public_offerings_table(conn)
 
     conn.commit()
     conn.close()
@@ -836,9 +1431,24 @@ def _coerce_history_date(value, default_time):
     raise TypeError(f"Unsupported date value: {value!r}")
 
 
-def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
+def _price_history_row_count(symbol):
+    """Return total stored price_history rows for one symbol."""
+    conn = get_db()
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM price_history WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()[0]
+            or 0
+        )
+    finally:
+        conn.close()
+
+
+def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None, raise_on_error=False):
     """
-    Fetch full OHLCV price history for a stock symbol from Merolagani.
+    Fetch full OHLCV price history for a stock symbol from ShareHub only.
     Saves to price_history table.
     Returns a DataFrame.
     """
@@ -864,50 +1474,8 @@ def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
         df = _fetch_price_history_from_sharehub(symbol, start_date=start_str, end_date=end_str)
 
         if df is None or df.empty:
-            df = _fetch_price_history_from_merolagani_history_tab(symbol)
-
-        # Fallback 1: Merolagani advanced chart endpoint
-        if df is None or df.empty:
-            params = {
-                "type": "get_advanced_chart",
-                "symbol": symbol.upper(),
-                "resolution": "1D",
-                "rangeStartDate": from_ts,
-                "rangeEndDate": to_ts,
-                "from": "",
-                "isAdjust": 1,
-                "currencyCode": "NPR",
-            }
-            resp = _get(CHART_HANDLER, params=params)
-            try:
-                data = resp.json()
-            except (ValueError, RequestsJSONDecodeError):
-                data = None
-
-            if data:
-                timestamps = data.get("t", [])
-                opens      = data.get("o", [])
-                highs      = data.get("h", [])
-                lows       = data.get("l", [])
-                closes     = data.get("c", [])
-                volumes    = data.get("v", [])
-
-                if timestamps:
-                    df = pd.DataFrame({
-                        "date":   [datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") for ts in timestamps],
-                        "open":   [float(v or 0) for v in opens],
-                        "high":   [float(v or 0) for v in highs],
-                        "low":    [float(v or 0) for v in lows],
-                        "close":  [float(v or 0) for v in closes],
-                        "volume": [float(v or 0) for v in volumes],
-                    })
-
-        # Fallback 2: Sharesansar endpoint
-        if df is None or df.empty:
-            df = _fetch_price_history_from_sharesansar(symbol)
-            if df is None or df.empty:
-                print(f"   No price history rows found for {symbol}")
-                return None
+            print(f"   No ShareHub price history rows found for {symbol}")
+            return None
 
         if start_date is not None:
             df = df[df["date"] >= _coerce_history_date(start_date, now).strftime("%Y-%m-%d")]
@@ -951,10 +1519,111 @@ def fetch_price_history(symbol, years_back=15, start_date=None, end_date=None):
     except Exception as e:
         print(f"[ERROR] Error fetching {symbol}: {e}")
         import traceback; traceback.print_exc()
+        if raise_on_error:
+            raise
         return None
 
 
 # ── BULK PRICE HISTORY (PARALLEL) ─────────────────────────────────────────────
+def _fetch_price_history_incremental_until_fetched(symbol, initial_wait=3.0, max_wait=60.0):
+    """
+    Retry a symbol until one of these terminal states happens:
+    - fresh data is fetched successfully
+    - symbol is already populated / up to date
+    - source genuinely returns no rows for a brand-new symbol
+
+    Real fetch errors do not advance to the next symbol immediately.
+    """
+    attempt = 0
+    rows_before = _price_history_row_count(symbol)
+
+    while True:
+        attempt += 1
+        try:
+            conn = get_db()
+            row = conn.execute(
+                "SELECT MAX(date) FROM price_history WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+            conn.close()
+            last_date = row[0] if row and row[0] else None
+
+            if last_date:
+                from_dt = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
+                today = datetime.now().date()
+                if from_dt.date() > today:
+                    return {
+                        "ok": True,
+                        "status": "up_to_date",
+                        "attempts": attempt,
+                        "rows_before": rows_before,
+                        "rows_after": rows_before,
+                        "fetched_rows": 0,
+                    }
+                print(
+                    f"   Incremental: fetching {symbol} from {from_dt.date()} "
+                    f"(last known: {last_date}) | attempt {attempt}"
+                )
+                result = fetch_price_history(
+                    symbol,
+                    start_date=from_dt.strftime("%Y-%m-%d"),
+                    raise_on_error=True,
+                )
+            else:
+                print(f"   Full fetch for new symbol: {symbol} | attempt {attempt}")
+                result = fetch_price_history(symbol, years_back=15, raise_on_error=True)
+
+            rows_after = _price_history_row_count(symbol)
+
+            if result is not None:
+                fetched_rows = len(result) if hasattr(result, "__len__") else max(0, rows_after - rows_before)
+                return {
+                    "ok": True,
+                    "status": "fetched",
+                    "attempts": attempt,
+                    "rows_before": rows_before,
+                    "rows_after": rows_after,
+                    "fetched_rows": fetched_rows,
+                }
+
+            if rows_after > 0:
+                return {
+                    "ok": True,
+                    "status": "up_to_date",
+                    "attempts": attempt,
+                    "rows_before": rows_before,
+                    "rows_after": rows_after,
+                    "fetched_rows": max(0, rows_after - rows_before),
+                }
+
+            print(f"   [EMPTY] {symbol}: source returned no rows; moving to next symbol.")
+            return {
+                "ok": False,
+                "status": "empty",
+                "attempts": attempt,
+                "rows_before": rows_before,
+                "rows_after": rows_after,
+                "fetched_rows": 0,
+            }
+
+        except Exception as e:
+            if isinstance(e, ValueError) and "start_date must be on or before end_date" in str(e):
+                return {
+                    "ok": True,
+                    "status": "up_to_date",
+                    "attempts": attempt,
+                    "rows_before": rows_before,
+                    "rows_after": rows_before,
+                    "fetched_rows": 0,
+                }
+            wait = min(initial_wait * (1.75 ** (attempt - 1)), max_wait)
+            print(
+                f"   [RETRY] {symbol}: attempt {attempt} failed with {type(e).__name__}: {e}. "
+                f"Retrying in {wait:.1f}s"
+            )
+            time.sleep(wait)
+
+
 def fetch_all_price_histories(max_workers=3):
     """
     Fetch price history incrementally for every company in the DB using parallel threads.
@@ -968,28 +1637,26 @@ def fetch_all_price_histories(max_workers=3):
     total = len(symbols)
     print(f"Fetching price history for {total} companies with {max_workers} workers...")
 
-    success, failed, completed = 0, 0, 0
+    success, empty, completed = 0, 0, 0
 
     def process_one(symbol):
-        try:
-            result = fetch_price_history_incremental(symbol)
-            return symbol, result is not None
-        except Exception:
-            return symbol, False
+        return symbol, _fetch_price_history_incremental_until_fetched(symbol)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_one, sym): sym for sym in symbols}
         for future in as_completed(futures):
-            sym, ok = future.result()
+            sym, result = future.result()
             completed += 1
-            if ok:
+            if result["ok"]:
                 success += 1
             else:
-                failed += 1
+                empty += 1
             if completed % 20 == 0:
-                print(f"Progress: {completed}/{total} | OK {success} | Failed {failed}")
+                print(
+                    f"Progress: {completed}/{total} | OK {success} | Empty {empty}"
+                )
 
-    print(f"\n[OK] Done. Success: {success} | Failed: {failed}")
+    print(f"\n[OK] Done. Success: {success} | Empty: {empty}")
 
 
 def fetch_all_price_history(max_workers=3):
@@ -1009,45 +1676,47 @@ def fetch_all_price_history(max_workers=3):
 
 FLOORSHEET_HANDLER = f"{BASE_URL}/handlers/NewFloorSheetHandler.ashx"
 
-def fetch_floor_sheet_for(symbol):
+
+def _fetch_floor_sheet_once(symbol):
     """
-    Fetch latest date's floor sheet (broker trades) for a symbol from Chukul.
-    Falls back to Merolagani only if needed.
-    Saves to floor_sheet table. Returns a DataFrame.
+    Fetch latest date's floor sheet (broker trades) for one symbol from Chukul.
+    Returns an empty DataFrame when the source has no rows for that symbol.
     """
     print(f"Fetching floor sheet for {symbol}...")
     all_rows = []
     page = 1
 
+    latest_summary = fetch_market_summary() or {}
+    target_date = latest_summary.get("date") or datetime.now().strftime("%Y-%m-%d")
+    fetched_at = datetime.now().isoformat()
+
+    while True:
+        resp = SESSION.get(
+            CHUKUL_FLOORSHEET_BY_DATE_URL,
+            params={"date": target_date, "page": page, "size": 500},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = [
+            row for row in (data.get("data") or [])
+            if str(row.get("symbol", "")).upper() == symbol.upper()
+        ]
+        all_rows.extend(content)
+        total_pages = int(data.get("last_page") or 1)
+        if page >= total_pages:
+            break
+        page += 1
+
+    if not all_rows:
+        print(f"   No floor sheet trades for {symbol} on {target_date}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    print(f"   Got {len(df)} trades across {page} page(s)")
+
+    conn = get_db()
     try:
-        latest_summary = fetch_market_summary() or {}
-        target_date = latest_summary.get("date") or datetime.now().strftime("%Y-%m-%d")
-        fetched_at = datetime.now().isoformat()
-
-        while True:
-            resp = SESSION.get(
-                CHUKUL_FLOORSHEET_BY_DATE_URL,
-                params={"date": target_date, "page": page, "size": 500},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = [row for row in (data.get("data") or []) if str(row.get("symbol", "")).upper() == symbol.upper()]
-            all_rows.extend(content)
-            total_pages = int(data.get("last_page") or 1)
-            if page >= total_pages:
-                break
-            page += 1
-
-        if not all_rows:
-            print(f"   No floor sheet trades for {symbol} on {target_date}")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(all_rows)
-        print(f"   Got {len(df)} trades across {page} page(s)")
-
-        conn = get_db()
-
         for _, row in df.iterrows():
             try:
                 conn.execute("""
@@ -1068,14 +1737,49 @@ def fetch_floor_sheet_for(symbol):
                 print(f"   Skipped row: {e}")
 
         conn.commit()
+    finally:
         conn.close()
-        print(f"[OK] Saved floor sheet for {symbol}")
-        return df
 
-    except Exception as e:
-        print(f"[ERROR] Error fetching floor sheet for {symbol}: {e}")
-        import traceback; traceback.print_exc()
-        return None
+    print(f"[OK] Saved floor sheet for {symbol}")
+    return df
+
+
+def fetch_floor_sheet_for(symbol, retry_until_fetched=True, initial_wait=3.0, max_wait=60.0, raise_on_error=False):
+    """
+    Fetch latest date's floor sheet for one symbol.
+
+    Retries transient errors until success by default. It only stops immediately
+    when the source genuinely returns no rows for that symbol.
+    """
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            df = _fetch_floor_sheet_once(symbol)
+            if df is None:
+                df = pd.DataFrame()
+
+            if df.empty:
+                return df
+
+            return df
+
+        except Exception as e:
+            print(f"[ERROR] Error fetching floor sheet for {symbol}: {e}")
+            import traceback; traceback.print_exc()
+
+            if not retry_until_fetched:
+                if raise_on_error:
+                    raise
+                return None
+
+            wait = min(initial_wait * (1.75 ** (attempt - 1)), max_wait)
+            print(
+                f"   [RETRY] floor_sheet {symbol}: attempt {attempt} failed with "
+                f"{type(e).__name__}: {e}. Retrying in {wait:.1f}s"
+            )
+            time.sleep(wait)
 
 
 # ── MARKET SUMMARY ─────────────────────────────────────────────────────────────
@@ -1101,7 +1805,21 @@ def fetch_market_summary():
     try:
         ensure_sector_index_table(conn)
 
-        # Method 0: ShareHub index-history feed (preferred)
+        # Method 0: ShareHub per-date analysis feed (preferred)
+        try:
+            latest_nepse_row = fetch_sharehub_index_analysis_for_date(today)
+            if latest_nepse_row:
+                print(f"[OK] Market summary saved from ShareHub date-wise-analysis for {latest_nepse_row['date']}")
+                return {
+                    "date": latest_nepse_row["date"],
+                    "nepse_index": latest_nepse_row["close"],
+                    "total_turnover": latest_nepse_row["turnover"],
+                    "total_volume": latest_nepse_row["volume"],
+                }
+        except Exception as sharehub_date_err:
+            print(f"   ShareHub date-wise-analysis failed, falling back to index history: {sharehub_date_err}")
+
+        # Method 1: ShareHub index-history feed
         try:
             latest_nepse_row = fetch_sharehub_index_history()
             if latest_nepse_row:
@@ -1115,7 +1833,7 @@ def fetch_market_summary():
         except Exception as sharehub_err:
             print(f"   ShareHub index history failed, falling back to Chukul: {sharehub_err}")
 
-        # Method 1: Chukul market-summary index feed
+        # Method 2: Chukul market-summary index feed
         try:
             resp = SESSION.get(CHUKUL_MARKET_SUMMARY_URL, params={"type": "index"}, timeout=20)
             resp.raise_for_status()
@@ -1163,7 +1881,8 @@ def fetch_market_summary():
                         "total_volume": total_volume,
                     }
         except Exception as chukul_err:
-            print(f"   Chukul index feed failed, falling back to legacy sources: {chukul_err}")
+            print(f"   Chukul index feed failed: {chukul_err}")
+            raise RuntimeError("Market summary unavailable from ShareHub and Chukul")
 
         # ── Method 1: JSON chart handler for NEPSE index ───────────────────────
         now = datetime.now()
@@ -1234,7 +1953,7 @@ def fetch_market_summary():
 
 
 # ── INCREMENTAL UPDATE ─────────────────────────────────────────────────────────
-def fetch_price_history_incremental(symbol):
+def fetch_price_history_incremental(symbol, raise_on_error=False):
     """
     Only fetch data newer than what we already have in the DB.
     Use this for daily updates after the initial full load.
@@ -1251,10 +1970,14 @@ def fetch_price_history_incremental(symbol):
         # Fetch from the day after our last record
         from_dt = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
         print(f"   Incremental: fetching {symbol} from {from_dt.date()} (last known: {last_date})")
-        return fetch_price_history(symbol, start_date=from_dt.strftime("%Y-%m-%d"))
+        return fetch_price_history(
+            symbol,
+            start_date=from_dt.strftime("%Y-%m-%d"),
+            raise_on_error=raise_on_error,
+        )
     else:
         print(f"   Full fetch for new symbol: {symbol}")
-        return fetch_price_history(symbol, years_back=15)
+        return fetch_price_history(symbol, years_back=15, raise_on_error=raise_on_error)
 
 
 # ── MAIN TEST RUN ──────────────────────────────────────────────────────────────

@@ -3,11 +3,12 @@ Run a full daily data refresh for this NEPSE project.
 
 What this updates:
 1) OHLCV + market summary + sector indexes (via src/pipeline/run_pipeline.py step 1)
-2) Floorsheet + broker_summary + daily_price (via src/data/floorsheet_pipeline.py --daily)
-3) Company metadata + news + dividend (via src/data/merolagani_pipeline.py)
-4) clean_price_history + signals + nepse_signals (via src/pipeline/run_pipeline.py --skip-fetch)
-5) derived analytics snapshots for scanners/profile pages (via build_derived_analytics.py)
-6) export latest LightGBM prediction batch into ml_predictions_daily (via export_lightgbm_predictions.py)
+2) ShareHub homepage feeds: index analysis, announcements, news feed, public offerings
+3) Floorsheet + broker_summary + daily_price (via src/data/floorsheet_pipeline.py --daily)
+4) Company metadata + news + dividend (via src/data/merolagani_pipeline.py)
+5) clean_price_history + signals + nepse_signals (via src/pipeline/run_pipeline.py --skip-fetch)
+6) derived analytics snapshots for scanners/profile pages (via build_derived_analytics.py)
+7) export latest LightGBM prediction batch into ml_predictions_daily (via export_lightgbm_predictions.py)
 
 Optional:
 - Upload all derived tables to Turso at the end.
@@ -99,6 +100,41 @@ def main():
         run_step(
             "Fetch OHLCV + market summary + sector indexes",
             ["src/pipeline/run_pipeline.py", "--step", "1"],
+        )
+        run_step(
+            "Fetch ShareHub per-date index analysis (homepage market snapshot)",
+            [
+                "-c",
+                "from datetime import datetime; from src.data.fetcher import fetch_sharehub_index_analysis_for_date; print(fetch_sharehub_index_analysis_for_date(datetime.now().strftime('%Y-%m-%d')))",
+            ],
+        )
+        run_step(
+            "Fetch Chukul sector-wise market-cap stock buckets",
+            [
+                "-c",
+                "from src.data.fetcher import fetch_chukul_sector_low_cap; print(fetch_chukul_sector_low_cap())",
+            ],
+        )
+        run_step(
+            "Fetch ShareHub announcements",
+            [
+                "-c",
+                "from src.data.fetcher import fetch_sharehub_announcements; print(fetch_sharehub_announcements())",
+            ],
+        )
+        run_step(
+            "Fetch ShareHub news feed",
+            [
+                "-c",
+                "from src.data.fetcher import fetch_sharehub_news_feed; print(fetch_sharehub_news_feed())",
+            ],
+        )
+        run_step(
+            "Fetch ShareHub public offerings",
+            [
+                "-c",
+                "from src.data.fetcher import fetch_sharehub_public_offerings; print(fetch_sharehub_public_offerings())",
+            ],
         )
 
     fs_args = ["src/data/floorsheet_pipeline.py", "--daily"]

@@ -34,6 +34,55 @@ except ImportError:
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DB_PATH = "data/nepse.db"
 
+LIMIT_EXEMPT_SYMBOLS = {
+    "C30MF", "CMF1", "CMF2", "GIBF1", "NBF2", "NBF3",
+    "RMF1", "RMF2", "SEF", "SFEF", "SIGS2", "SIGS3",
+    "CSY", "GSY", "KSY", "NSY", "RSY", "GIMES1",
+}
+
+
+def is_regular_equity_symbol(symbol: str) -> bool:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return False
+    if sym in LIMIT_EXEMPT_SYMBOLS:
+        return False
+    if any(ch.isdigit() for ch in sym):
+        return False
+    if sym.endswith("PO") or sym.endswith("P"):
+        return False
+    return True
+
+
+def enforce_iterative_move_limit(df: pd.DataFrame, move_limit: float) -> pd.DataFrame:
+    """
+    Re-apply the move cap to the retained sequence so a day cannot survive only
+    because the immediately previous raw day was already removed.
+    """
+    if df.empty:
+        return df
+
+    kept_rows = []
+    last_close = None
+
+    for _, row in df.iterrows():
+        close = row["close"]
+        if pd.isna(close) or close <= 0:
+            continue
+        if last_close is None:
+            kept_rows.append(row.to_dict())
+            last_close = close
+            continue
+
+        pct_move = abs((close - last_close) / last_close) * 100
+        if pct_move <= move_limit:
+            kept_rows.append(row.to_dict())
+            last_close = close
+
+    if not kept_rows:
+        return df.iloc[0:0].copy()
+    return pd.DataFrame(kept_rows)
+
 
 # ── DB HELPER ─────────────────────────────────────────────────────────────────
 
@@ -125,9 +174,14 @@ def clean_symbol(symbol):
         df["_prev_close"] = df["close"].shift(1)
         df["_pct"] = (df["close"] - df["_prev_close"]).abs() / df["_prev_close"] * 100
         # Keep first row (no previous close) and rows within ±30 %
-        df = df[(df["_pct"].isna()) | (df["_pct"] <= 30)]
+        move_limit = 10.2 if is_regular_equity_symbol(symbol) else 30.0
+        df = df[(df["_pct"].isna()) | (df["_pct"] <= move_limit)]
         df.drop(columns=["_prev_close", "_pct"], inplace=True)
         df.reset_index(drop=True, inplace=True)
+
+        if is_regular_equity_symbol(symbol):
+            df = enforce_iterative_move_limit(df, move_limit)
+            df.reset_index(drop=True, inplace=True)
 
         removed = original_len - len(df)
 
@@ -184,6 +238,7 @@ def clean_symbol(symbol):
         # ── PERSIST ───────────────────────────────────────────────────────────
         cleaned_at = datetime.now().isoformat()
         saved = 0
+        conn.execute("DELETE FROM clean_price_history WHERE symbol = ?", (symbol,))
         for _, row in df.iterrows():
             try:
                 conn.execute("""

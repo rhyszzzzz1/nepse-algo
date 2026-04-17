@@ -150,6 +150,14 @@ def _extract_isin(item: Any) -> str | None:
     return None
 
 
+def _normalize_boid(boid: str | None, demat: str | None) -> str | None:
+    boid_value = str(boid).strip() if boid not in (None, "") else None
+    demat_value = str(demat).strip() if demat not in (None, "") else None
+    if demat_value and (not boid_value or len(boid_value) < len(demat_value)):
+        return demat_value
+    return boid_value or demat_value
+
+
 def _fetch_account_row(conn: sqlite3.Connection, account_id: int):
     return conn.execute(
         """
@@ -179,6 +187,53 @@ def _record_sync_run(
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (account_id, sync_type, started, _utcnow(), status, int(row_count), error_message),
+    )
+
+
+def _merge_holding_row(
+    base: HoldingRow | None,
+    incoming: HoldingRow,
+    *,
+    prefer_quantity: bool = False,
+    prefer_market_values: bool = False,
+) -> HoldingRow:
+    if base is None:
+        return incoming
+    quantity = incoming.quantity if prefer_quantity and incoming.quantity not in (None, 0) else base.quantity
+    if quantity in (None, 0) and incoming.quantity not in (None, 0):
+        quantity = incoming.quantity
+    wacc = incoming.wacc if incoming.wacc not in (None, 0) else base.wacc
+    market_rate = incoming.market_rate if prefer_market_values and incoming.market_rate not in (None, 0) else base.market_rate
+    market_value = incoming.market_value if prefer_market_values and incoming.market_value not in (None, 0) else base.market_value
+    if market_rate in (None, 0) and incoming.market_rate not in (None, 0):
+        market_rate = incoming.market_rate
+    if market_value in (None, 0) and incoming.market_value not in (None, 0):
+        market_value = incoming.market_value
+    security_name = incoming.security_name or base.security_name
+    raw = dict(base.raw or {})
+    if incoming.raw:
+        raw.update(incoming.raw)
+    return HoldingRow(
+        symbol=base.symbol or incoming.symbol,
+        security_name=security_name,
+        quantity=quantity or 0.0,
+        wacc=wacc,
+        market_rate=market_rate,
+        market_value=market_value,
+        raw=raw,
+    )
+
+
+def _build_wacc_holding(row: PurchaseHistoryRow) -> HoldingRow:
+    raw = row.raw or {}
+    return HoldingRow(
+        symbol=row.symbol,
+        security_name=raw.get("companyName") or raw.get("securityName") or raw.get("name") or row.symbol,
+        quantity=row.quantity,
+        wacc=row.wacc,
+        market_rate=row.rate or raw.get("rate"),
+        market_value=row.amount,
+        raw=raw,
     )
 
 
@@ -237,6 +292,7 @@ def connect_meroshare_account(
     client = MeroShareClient()
     session = client.login(MeroShareCredentials(client_id=client_id, username=username, password=password))
     own_detail = client.get_own_detail()
+    normalized_boid = _normalize_boid(own_detail.boid, own_detail.demat)
     linked_accounts = client.get_linked_accounts(own_detail.customer_id) if own_detail.customer_id else []
     now = _utcnow()
 
@@ -256,7 +312,7 @@ def connect_meroshare_account(
             (
                 label or own_detail.name or username,
                 own_detail.name,
-                own_detail.boid,
+                normalized_boid,
                 own_detail.demat,
                 own_detail.client_code,
                 own_detail.customer_id,
@@ -279,7 +335,7 @@ def connect_meroshare_account(
                 int(client_id),
                 str(username),
                 own_detail.name,
-                own_detail.boid,
+                normalized_boid,
                 own_detail.demat,
                 own_detail.client_code,
                 own_detail.customer_id,
@@ -366,9 +422,12 @@ def sync_meroshare_account(
         own_detail = client.get_own_detail()
 
     linked_accounts = client.get_linked_accounts(own_detail.customer_id) if own_detail.customer_id else []
+    normalized_boid = _normalize_boid(own_detail.boid, own_detail.demat)
     snapshot_at = _utcnow()
     summary: dict[str, Any] = {"source": "portfolio_view"}
     holdings: list[HoldingRow] = []
+    holdings_by_symbol: dict[str, HoldingRow] = {}
+    base_holding_symbols: set[str] = set()
 
     portfolio_payload: dict[str, Any] = {}
     if own_detail.demat and own_detail.client_code:
@@ -400,34 +459,118 @@ def sync_meroshare_account(
             )
         except MeroShareClientError as exc:
             summary.update({"portfolio_view_error": str(exc)})
+        else:
+            for holding in holdings:
+                if holding.symbol:
+                    holdings_by_symbol[holding.symbol] = holding
+                    base_holding_symbols.add(holding.symbol)
+
+    direct_holdings: list[HoldingRow] = []
+    if normalized_boid or own_detail.demat:
+        try:
+            direct_holdings = client.get_holdings(
+                boid=normalized_boid,
+                demat=own_detail.demat,
+                page=1,
+                size=500,
+            )
+        except MeroShareClientError as exc:
+            summary.update({"my_holdings_error": str(exc)})
+        else:
+            for holding in direct_holdings:
+                if not holding.symbol:
+                    continue
+                base_holding_symbols.add(holding.symbol)
+                holdings_by_symbol[holding.symbol] = _merge_holding_row(
+                    holdings_by_symbol.get(holding.symbol),
+                    holding,
+                    prefer_quantity=True,
+                    prefer_market_values=True,
+                )
 
     wacc_rows = []
-    if own_detail.boid:
+    if normalized_boid:
         try:
-            wacc_rows = client.get_wacc_summary_report(boid=own_detail.boid, page=1, size=500)
+            wacc_rows = client.get_wacc_summary_report(boid=normalized_boid, page=1, size=500)
         except MeroShareClientError:
             wacc_rows = []
-
-    if not holdings and wacc_rows:
-        for row in wacc_rows:
-            raw = row.raw or {}
-            holdings.append(
-                HoldingRow(
-                    symbol=row.symbol,
-                    security_name=raw.get("companyName") or raw.get("securityName") or raw.get("name") or row.symbol,
-                    quantity=row.quantity,
-                    wacc=row.wacc,
-                    market_rate=row.rate or raw.get("rate"),
-                    market_value=row.amount,
-                    raw=raw,
-                )
+    if not wacc_rows and own_detail.demat:
+        try:
+            wacc_rows = client.get_wacc_report_via_browser(
+                demat=own_detail.demat,
+                boid=normalized_boid,
+                client_code=own_detail.client_code,
+                page=1,
+                size=500,
             )
+            if wacc_rows:
+                summary["wacc_source"] = "browser_fallback"
+        except MeroShareClientError as exc:
+            summary["wacc_browser_error"] = str(exc)
+    elif wacc_rows:
+        summary["wacc_source"] = "direct_api"
+
+    purchase_history_rows = []
+    if normalized_boid:
+        try:
+            purchase_history_rows = client.get_purchase_history(boid=normalized_boid, page=1, size=500)
+        except MeroShareClientError:
+            purchase_history_rows = []
+
+    if wacc_rows:
+        for row in wacc_rows:
+            if not row.symbol:
+                continue
+            if base_holding_symbols and row.symbol not in base_holding_symbols:
+                continue
+            holdings_by_symbol[row.symbol] = _merge_holding_row(
+                holdings_by_symbol.get(row.symbol),
+                _build_wacc_holding(row),
+                prefer_quantity=False,
+                prefer_market_values=False,
+            )
+    if not holdings_by_symbol and wacc_rows:
         summary["source"] = "wacc_summary_fallback"
         summary["fallback_reason"] = "portfolio view returned no holdings for the account."
+
+    if purchase_history_rows:
+        latest_purchase_by_symbol: dict[str, PurchaseHistoryRow] = {}
+        for row in purchase_history_rows:
+            if not row.symbol:
+                continue
+            existing = latest_purchase_by_symbol.get(row.symbol)
+            if existing is None:
+                latest_purchase_by_symbol[row.symbol] = row
+                continue
+            existing_date = existing.transaction_date or ""
+            incoming_date = row.transaction_date or ""
+            if incoming_date >= existing_date:
+                latest_purchase_by_symbol[row.symbol] = row
+        for symbol, row in latest_purchase_by_symbol.items():
+            if base_holding_symbols and symbol not in base_holding_symbols:
+                continue
+            raw = row.raw or {}
+            purchase_holding = HoldingRow(
+                symbol=symbol,
+                security_name=raw.get("companyName") or raw.get("securityName") or raw.get("name") or symbol,
+                quantity=row.quantity,
+                wacc=row.wacc or row.rate,
+                market_rate=None,
+                market_value=None,
+                raw=raw,
+            )
+            holdings_by_symbol[symbol] = _merge_holding_row(
+                holdings_by_symbol.get(symbol),
+                purchase_holding,
+                prefer_quantity=False,
+                prefer_market_values=False,
+            )
+
+    holdings = sorted(holdings_by_symbol.values(), key=lambda item: ((item.market_value or 0), item.quantity, item.symbol), reverse=True)
     transactions = []
-    if include_transactions and own_detail.boid and own_detail.client_code:
+    if include_transactions and normalized_boid and own_detail.client_code:
         try:
-            transactions = client.get_transaction_history(boid=own_detail.boid, client_code=own_detail.client_code, page=1, size=500)
+            transactions = client.get_transaction_history(boid=normalized_boid, client_code=own_detail.client_code, page=1, size=500)
         except MeroShareClientError:
             transactions = []
 
@@ -439,7 +582,7 @@ def sync_meroshare_account(
         """,
         (
             own_detail.name,
-            own_detail.boid,
+            normalized_boid,
             own_detail.demat,
             own_detail.client_code,
             own_detail.customer_id,
@@ -480,9 +623,14 @@ def sync_meroshare_account(
             ),
         )
 
+    purchase_rows_to_store = []
     if wacc_rows:
+        purchase_rows_to_store.extend(wacc_rows)
+    if purchase_history_rows:
+        purchase_rows_to_store.extend(purchase_history_rows)
+    if purchase_rows_to_store:
         conn.execute("DELETE FROM meroshare_purchase_history WHERE account_id = ?", (account_id,))
-        for row in wacc_rows:
+        for row in purchase_rows_to_store:
             conn.execute(
                 """
                 INSERT INTO meroshare_purchase_history(
@@ -536,7 +684,7 @@ def sync_meroshare_account(
         "summary": summary,
         "snapshot_at": snapshot_at,
         "holdings_count": len(holdings),
-        "purchase_rows": len(wacc_rows),
+        "purchase_rows": len(purchase_rows_to_store),
         "transaction_rows": len(transactions),
     }
 
@@ -608,6 +756,49 @@ def get_meroshare_transactions(conn: sqlite3.Connection, account_id: int) -> dic
 
 def import_meroshare_holdings_to_portfolio(conn: sqlite3.Connection, portfolio_id: int, account_id: int) -> dict[str, Any]:
     ensure_meroshare_tables(conn)
+
+    def resolve_import_metrics(symbol: str, snapshot_row: sqlite3.Row | None = None) -> tuple[float, str, str | None]:
+        if snapshot_row is not None and snapshot_row["wacc"] not in (None, ""):
+            return float(snapshot_row["wacc"]), "Imported from MeroShare holdings snapshot WACC", None
+
+        history_rows = conn.execute(
+            """
+            SELECT transaction_date, quantity, rate, amount, wacc, transaction_type
+            FROM meroshare_purchase_history
+            WHERE account_id = ? AND symbol = ?
+            ORDER BY
+                CASE WHEN UPPER(COALESCE(transaction_type, '')) = 'WACC' THEN 0 ELSE 1 END,
+                transaction_date DESC,
+                id DESC
+            """,
+            (account_id, symbol),
+        ).fetchall()
+
+        opened_at = None
+        if history_rows:
+            dated = [row["transaction_date"] for row in history_rows if row["transaction_date"]]
+            opened_at = min(dated) if dated else None
+
+        for row in history_rows:
+            wacc = row["wacc"]
+            rate = row["rate"]
+            qty = float(row["quantity"] or 0)
+            amount = float(row["amount"] or 0)
+            if wacc not in (None, ""):
+                return float(wacc), "Imported from MeroShare WACC summary", opened_at
+            if qty > 0 and rate not in (None, ""):
+                return float(rate), "Imported from MeroShare purchase history", opened_at
+            if qty > 0 and amount > 0:
+                return amount / qty, "Imported from MeroShare purchase history amount", opened_at
+
+        existing_position = conn.execute(
+            "SELECT avg_cost, opened_at FROM portfolio_positions WHERE portfolio_id = ? AND symbol = ?",
+            (portfolio_id, symbol),
+        ).fetchone()
+        if existing_position and float(existing_position["avg_cost"] or 0) > 0:
+            return float(existing_position["avg_cost"]), "Kept existing portfolio cost basis", existing_position["opened_at"] or opened_at
+        return 0.0, "Imported from MeroShare without cost basis data", opened_at
+
     portfolio = conn.execute("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
     if not portfolio:
         raise MeroShareClientError("Portfolio not found.")
@@ -628,21 +819,46 @@ def import_meroshare_holdings_to_portfolio(conn: sqlite3.Connection, portfolio_i
         """,
         (account_id, snapshot_at),
     ).fetchall()
+    snapshot_symbols = {str(row["symbol"]) for row in rows}
+    stale_symbols = [
+        row["symbol"]
+        for row in conn.execute(
+            """
+            SELECT symbol
+            FROM portfolio_position_sources
+            WHERE portfolio_id = ? AND source_type = 'meroshare' AND source_account_id = ?
+            """,
+            (portfolio_id, account_id),
+        ).fetchall()
+        if row["symbol"] not in snapshot_symbols
+    ]
+    for symbol in stale_symbols:
+        conn.execute(
+            "DELETE FROM portfolio_position_sources WHERE portfolio_id = ? AND symbol = ? AND source_type = 'meroshare'",
+            (portfolio_id, symbol),
+        )
+        conn.execute(
+            "DELETE FROM portfolio_positions WHERE portfolio_id = ? AND symbol = ?",
+            (portfolio_id, symbol),
+        )
     imported = 0
     for row in rows:
+        qty = float(row["quantity"] or 0)
+        avg_cost, note_prefix, opened_at = resolve_import_metrics(str(row["symbol"]), row)
         conn.execute(
             """
-            INSERT INTO portfolio_positions(portfolio_id, symbol, qty, avg_cost, notes)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO portfolio_positions(portfolio_id, symbol, qty, avg_cost, opened_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(portfolio_id, symbol)
-            DO UPDATE SET qty=excluded.qty, avg_cost=excluded.avg_cost, notes=excluded.notes
+            DO UPDATE SET qty=excluded.qty, avg_cost=excluded.avg_cost, opened_at=COALESCE(excluded.opened_at, portfolio_positions.opened_at), notes=excluded.notes
             """,
             (
                 portfolio_id,
                 row["symbol"],
-                float(row["quantity"] or 0),
-                float(row["wacc"] or 0),
-                f"Imported from MeroShare account {account_id} on {snapshot_at}",
+                qty,
+                avg_cost,
+                opened_at,
+                f"{note_prefix} | MeroShare account {account_id} snapshot {snapshot_at}",
             ),
         )
         conn.execute(

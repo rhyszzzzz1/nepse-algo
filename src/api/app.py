@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 import sqlite3
 import re
 import json
-from datetime import datetime
+import requests
+from datetime import datetime, date
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from src.integrations.meroshare import (
@@ -37,6 +38,8 @@ from src.integrations.meroshare import (
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
+
+SHAREHUB_TODAYS_PRICE_URL = "https://sharehubnepal.com/live/api/v2/nepselive/todays-price"
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 try:
@@ -424,6 +427,94 @@ def row_to_dict(row):
     return dict(row) if row else None
 
 
+def get_table_columns(conn, table_name):
+    if not table_exists(conn, table_name):
+        return set()
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def build_companies_catalog(conn):
+    company_columns = get_table_columns(conn, "companies")
+    latest_snapshot_date = get_table_max_date(conn, "stock_factor_snapshot")
+
+    catalog = {}
+
+    if company_columns:
+        select_parts = ["symbol"]
+        if "name" in company_columns:
+            select_parts.append("name")
+        elif "label" in company_columns:
+            select_parts.append("label")
+        if "sector" in company_columns:
+            select_parts.append("sector")
+        company_rows = conn.execute(
+            f"SELECT {', '.join(select_parts)} FROM companies ORDER BY symbol"
+        ).fetchall()
+        for row in company_rows:
+            symbol = row["symbol"]
+            label = row["name"] if "name" in row.keys() else row["label"] if "label" in row.keys() else symbol
+            sector = row["sector"] if "sector" in row.keys() else None
+            catalog[symbol] = {
+                "symbol": symbol,
+                "name": label or symbol,
+                "sector": sector or "Unknown",
+            }
+
+    if latest_snapshot_date:
+        snapshot_rows = conn.execute(
+            """
+            SELECT DISTINCT symbol, security_name, sector
+            FROM stock_factor_snapshot
+            WHERE date = ?
+            ORDER BY symbol
+            """,
+            (latest_snapshot_date,),
+        ).fetchall()
+        for row in snapshot_rows:
+            symbol = row["symbol"]
+            entry = catalog.setdefault(
+                symbol,
+                {"symbol": symbol, "name": symbol, "sector": "Unknown"},
+            )
+            if row["security_name"]:
+                entry["name"] = row["security_name"]
+            if row["sector"]:
+                entry["sector"] = row["sector"]
+
+    live_symbol_rows = conn.execute(
+        """
+        SELECT symbol FROM (
+            SELECT DISTINCT symbol FROM daily_price
+            UNION
+            SELECT DISTINCT symbol FROM price_history
+            UNION
+            SELECT DISTINCT symbol FROM stock_factor_snapshot
+        )
+        ORDER BY symbol
+        """
+    ).fetchall()
+    for row in live_symbol_rows:
+        symbol = row["symbol"]
+        catalog.setdefault(
+            symbol,
+            {"symbol": symbol, "name": symbol, "sector": "Unknown"},
+        )
+
+    return [catalog[symbol] for symbol in sorted(catalog)]
+
+
+def normalize_floorsheet_trade_rows(trades):
+    normalized = []
+    for trade in trades:
+        row = dict(trade)
+        if row.get("buyer_broker") is None:
+            row["buyer_broker"] = "-"
+        if row.get("seller_broker") is None:
+            row["seller_broker"] = "-"
+        normalized.append(row)
+    return normalized
+
+
 def sanitize_meroshare_account(account):
     if not account:
         return None
@@ -446,14 +537,19 @@ def build_market_breadth_dataset(conn, latest_daily_date, previous_daily_date):
         return []
     query = """
         WITH latest_market AS (
-            SELECT symbol, open, high, low, close, volume
-            FROM price_history
+            SELECT symbol, open, high, low, close, volume, price_change_pct
+            FROM clean_price_history
             WHERE date = ?
         ),
-        previous_market AS (
-            SELECT symbol, close AS previous_close
-            FROM price_history
-            WHERE date = ?
+        latest_with_previous AS (
+            SELECT
+                lm.*,
+                CASE
+                    WHEN lm.price_change_pct IS NULL THEN NULL
+                    WHEN ABS(100.0 + lm.price_change_pct) < 0.000001 THEN NULL
+                    ELSE lm.close / (1.0 + (lm.price_change_pct / 100.0))
+                END AS previous_close
+            FROM latest_market lm
         ),
         latest_activity AS (
             SELECT symbol, open, high, low, volume, amount, trades
@@ -480,18 +576,16 @@ def build_market_breadth_dataset(conn, latest_daily_date, previous_daily_date):
             COALESCE(ac.company_name, lm.symbol) AS company_name,
             ac.sector,
             ROUND(lm.close, 4) AS ltp,
-            ROUND(lm.close - pm.previous_close, 4) AS change,
-            ROUND(((lm.close - pm.previous_close) / NULLIF(pm.previous_close, 0)) * 100.0, 4) AS change_percent,
+            ROUND(lm.close - lm.previous_close, 4) AS change,
+            ROUND(lm.price_change_pct, 4) AS change_percent,
             ROUND(COALESCE(la.open, lm.open), 4) AS open,
             ROUND(COALESCE(la.high, lm.high), 4) AS high,
             ROUND(COALESCE(la.low, lm.low), 4) AS low,
             ROUND(COALESCE(la.volume, lm.volume), 4) AS volume,
             ROUND(COALESCE(la.amount, 0), 4) AS turnover,
             ROUND(COALESCE(lt.ltv, 0), 4) AS ltv,
-            ROUND(pm.previous_close, 4) AS previous_close
-        FROM latest_market lm
-        JOIN previous_market pm
-          ON pm.symbol = lm.symbol
+            ROUND(lm.previous_close, 4) AS previous_close
+        FROM latest_with_previous lm
         LEFT JOIN latest_activity la
           ON la.symbol = lm.symbol
         LEFT JOIN last_trade lt
@@ -502,7 +596,7 @@ def build_market_breadth_dataset(conn, latest_daily_date, previous_daily_date):
     return rows_to_list(
         conn.execute(
             query,
-            (latest_daily_date, previous_daily_date, latest_daily_date, latest_daily_date),
+            (latest_daily_date, latest_daily_date, latest_daily_date),
         ).fetchall()
     )
 
@@ -533,6 +627,61 @@ def fetch_latest_scanner_rows(conn, scanner_name, batch_date=None, limit=200, se
 
 
 def compute_portfolio_health(conn, portfolio_id):
+    def brokerage_rate(amount):
+        amount = float(amount or 0)
+        if amount <= 50000:
+            return 0.0036
+        if amount <= 500000:
+            return 0.0033
+        if amount <= 2000000:
+            return 0.0031
+        if amount <= 10000000:
+            return 0.0027
+        return 0.0024
+
+    def brokerage_fee(amount):
+        amount = float(amount or 0)
+        fee = amount * brokerage_rate(amount)
+        return max(fee, 10.0)
+
+    def buy_side_charges(amount):
+        amount = float(amount or 0)
+        return {
+            "broker_fee": round(brokerage_fee(amount), 4),
+            "sebon_fee": round(amount * 0.00015, 4),
+            "dp_fee": 25.0,
+            "transfer_fee": 5.0,
+        }
+
+    def sell_side_charges(amount):
+        amount = float(amount or 0)
+        return {
+            "broker_fee": round(brokerage_fee(amount), 4),
+            "sebon_fee": round(amount * 0.00015, 4),
+            "dp_fee": 25.0,
+        }
+
+    def sum_charges(charges):
+        return round(sum(float(v or 0) for v in charges.values()), 4)
+
+    def holding_period_days(opened_at):
+        if not opened_at:
+            return None
+        normalized = str(opened_at).strip()
+        for parser in (datetime.fromisoformat,):
+            try:
+                opened = parser(normalized.replace("Z", "+00:00"))
+                return max((date.today() - opened.date()).days, 0)
+            except Exception:
+                continue
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                opened = datetime.strptime(normalized, fmt)
+                return max((date.today() - opened.date()).days, 0)
+            except Exception:
+                continue
+        return None
+
     positions = rows_to_list(
         conn.execute(
             """
@@ -562,31 +711,89 @@ def compute_portfolio_health(conn, portfolio_id):
     enriched = []
     total_cost = 0.0
     total_value = 0.0
+    total_receivable = 0.0
+    total_buy_fees = 0.0
+    total_sell_fees = 0.0
+    total_tax = 0.0
+    total_day_pnl = 0.0
+    total_qty = 0.0
+    known_cost_position_count = 0
     composite_weight = 0.0
     risk_weight = 0.0
     for row in positions:
         qty = float(row.get("qty") or 0)
         avg_cost = float(row.get("avg_cost") or 0)
         close = float(row.get("close") or 0)
-        cost = qty * avg_cost
-        value = qty * close
-        pnl = value - cost
-        pnl_pct = (pnl / cost * 100.0) if cost else 0.0
-        total_cost += cost
+        change_pct = float(row.get("change_pct") or 0)
+        cost_basis_known = avg_cost > 0
+        gross_buy = qty * avg_cost
+        gross_sale = qty * close
+        buy_charges = buy_side_charges(gross_buy) if qty > 0 and avg_cost > 0 else {
+            "broker_fee": 0.0,
+            "sebon_fee": 0.0,
+            "dp_fee": 0.0,
+            "transfer_fee": 0.0,
+        }
+        sell_charges = sell_side_charges(gross_sale) if qty > 0 and close > 0 else {
+            "broker_fee": 0.0,
+            "sebon_fee": 0.0,
+            "dp_fee": 0.0,
+        }
+        buy_fee_total = sum_charges(buy_charges)
+        sell_fee_total = sum_charges(sell_charges)
+        cost = gross_buy + buy_fee_total
+        value = gross_sale
+        pre_tax_pnl = gross_sale - sell_fee_total - cost if cost_basis_known else None
+        held_days = holding_period_days(row.get("opened_at"))
+        cgt_rate = 0.05 if held_days is not None and held_days > 365 else 0.075
+        capital_gains_tax = round(max(pre_tax_pnl, 0.0) * cgt_rate, 4) if pre_tax_pnl is not None else 0.0
+        receivable = gross_sale - sell_fee_total - capital_gains_tax if cost_basis_known else None
+        pnl = (receivable - cost) if cost_basis_known and receivable is not None else None
+        pnl_pct = (pnl / cost * 100.0) if cost_basis_known and cost and pnl is not None else None
+        previous_close = close / (1.0 + (change_pct / 100.0)) if close and abs(100.0 + change_pct) > 1e-9 else close
+        day_pnl = (close - previous_close) * qty if close and previous_close else 0.0
+
+        if cost_basis_known:
+            total_cost += cost
+            total_receivable += receivable or 0.0
+            total_buy_fees += buy_fee_total
+            total_sell_fees += sell_fee_total
+            total_tax += capital_gains_tax
+            known_cost_position_count += 1
         total_value += value
+        total_day_pnl += day_pnl
+        total_qty += qty
         composite_weight += float(row.get("composite_score") or 0) * value
         risk_weight += float(row.get("risk_score") or 0) * value
         row.update(
             {
+                "cost_basis_known": cost_basis_known,
+                "gross_cost": round(gross_buy, 4),
+                "gross_sale_value": round(gross_sale, 4),
+                "buy_broker_fee": round(buy_charges["broker_fee"], 4),
+                "buy_sebon_fee": round(buy_charges["sebon_fee"], 4),
+                "buy_dp_fee": round(buy_charges["dp_fee"], 4),
+                "buy_transfer_fee": round(buy_charges["transfer_fee"], 4),
+                "buy_fee_total": round(buy_fee_total, 4),
+                "sell_broker_fee": round(sell_charges["broker_fee"], 4),
+                "sell_sebon_fee": round(sell_charges["sebon_fee"], 4),
+                "sell_dp_fee": round(sell_charges["dp_fee"], 4),
+                "sell_fee_total": round(sell_fee_total, 4),
+                "estimated_capital_gains_tax": round(capital_gains_tax, 4),
+                "receivable_amount": round(receivable, 4) if receivable is not None else None,
                 "market_value": round(value, 4),
-                "cost_basis": round(cost, 4),
-                "pnl": round(pnl, 4),
-                "pnl_pct": round(pnl_pct, 4),
+                "cost_basis": round(cost, 4) if cost_basis_known else None,
+                "pre_tax_pnl": round(pre_tax_pnl, 4) if pre_tax_pnl is not None else None,
+                "pnl": round(pnl, 4) if pnl is not None else None,
+                "pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
+                "day_pnl": round(day_pnl, 4),
+                "holding_days": held_days,
+                "capital_gains_tax_rate": cgt_rate,
             }
         )
         enriched.append(row)
 
-    total_pnl = total_value - total_cost
+    total_pnl = total_receivable - total_cost
     avg_composite = (composite_weight / total_value) if total_value else 0.0
     avg_risk = (risk_weight / total_value) if total_value else 0.0
     return {
@@ -595,11 +802,22 @@ def compute_portfolio_health(conn, portfolio_id):
         "summary": {
             "total_cost": round(total_cost, 4),
             "market_value": round(total_value, 4),
+            "receivable_amount": round(total_receivable, 4),
+            "total_buy_fees": round(total_buy_fees, 4),
+            "total_sell_fees": round(total_sell_fees, 4),
+            "estimated_capital_gains_tax": round(total_tax, 4),
             "total_pnl": round(total_pnl, 4),
             "total_pnl_pct": round((total_pnl / total_cost * 100.0), 4) if total_cost else 0.0,
+            "day_pnl": round(total_day_pnl, 4),
             "avg_composite_score": round(avg_composite, 4),
             "avg_risk_score": round(avg_risk, 4),
             "position_count": len(enriched),
+            "known_cost_position_count": known_cost_position_count,
+            "current_units": round(total_qty, 4),
+            "sold_units": 0.0,
+            "sold_value": 0.0,
+            "dividend": 0.0,
+            "realized_pnl": 0.0,
         },
     }
 
@@ -836,6 +1054,7 @@ def trigger_scrape():
 def market_overview():
     conn = get_db()
     try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         latest_daily_date = get_table_max_date(conn, "daily_price")
         latest_market_summary = conn.execute(
             "SELECT * FROM market_summary ORDER BY date DESC LIMIT 1"
@@ -862,6 +1081,12 @@ def market_overview():
         top_traded = []
         top_transactions = []
         sector_leaders = []
+        marquee_strip = []
+        recent_news = []
+        public_offerings = []
+        bulk_transactions = []
+        recent_announcements = []
+        proposed_dividends = []
 
         if latest_daily_date and previous_daily_date:
             market_totals_row = conn.execute(
@@ -883,13 +1108,20 @@ def market_overview():
                 """
                 WITH latest AS (
                     SELECT symbol, close, high, low
-                    FROM price_history
+                    FROM daily_price
                     WHERE date = ?
                 ),
                 previous AS (
-                    SELECT symbol, close
-                    FROM price_history
-                    WHERE date = ?
+                    SELECT ph.symbol, ph.close
+                    FROM price_history ph
+                    JOIN (
+                        SELECT symbol, MAX(date) AS previous_date
+                        FROM price_history
+                        WHERE date < ?
+                        GROUP BY symbol
+                    ) prev
+                      ON prev.symbol = ph.symbol
+                     AND prev.previous_date = ph.date
                 )
                 SELECT
                     COUNT(*) AS compared_symbols,
@@ -898,6 +1130,7 @@ def market_overview():
                     SUM(CASE WHEN latest.close = previous.close THEN 1 ELSE 0 END) AS unchanged,
                     SUM(
                         CASE
+                            WHEN about_company.symbol IS NULL THEN 0
                             WHEN previous.close IS NOT NULL
                              AND previous.close <> 0
                              AND ((latest.close - previous.close) / previous.close) * 100.0 >= 9.95
@@ -907,6 +1140,7 @@ def market_overview():
                     ) AS positive_circuit,
                     SUM(
                         CASE
+                            WHEN about_company.symbol IS NULL THEN 0
                             WHEN previous.close IS NOT NULL
                              AND previous.close <> 0
                              AND ((latest.close - previous.close) / previous.close) * 100.0 <= -9.95
@@ -916,21 +1150,77 @@ def market_overview():
                     ) AS negative_circuit
                 FROM latest
                 JOIN previous ON previous.symbol = latest.symbol
+                LEFT JOIN about_company ON about_company.symbol = latest.symbol
                 """,
-                (latest_daily_date, previous_daily_date),
+                (latest_daily_date, latest_daily_date),
             ).fetchone()
             if breadth_row:
                 breadth = dict(breadth_row)
 
+            try:
+                resp = requests.get(
+                    SHAREHUB_TODAYS_PRICE_URL,
+                    params={
+                        "queryKey[0]": "todayPrice",
+                        "queryKey[1][order]": "",
+                        "queryKey[1][sortBy]": "",
+                        "queryKey[1][searchText]": "",
+                        "queryKey[1][page]": 1,
+                        "queryKey[1][limit]": 500,
+                        "queryKey[1][sortDirection]": "",
+                    },
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                items = payload.get("data") or payload.get("items") or payload.get("results") or []
+                live_breadth = {
+                    "advanced": 0,
+                    "declined": 0,
+                    "unchanged": 0,
+                    "positive_circuit": 0,
+                    "negative_circuit": 0,
+                    "compared_symbols": 0,
+                }
+                for item in items:
+                    prev_close = item.get("previousDayClosePrice")
+                    ltp = item.get("ltp")
+                    change_pct = item.get("changePercent")
+                    high = item.get("highPrice")
+                    low = item.get("lowPrice")
+                    if prev_close is None or ltp is None:
+                        continue
+                    live_breadth["compared_symbols"] += 1
+                    if ltp > prev_close:
+                        live_breadth["advanced"] += 1
+                    elif ltp < prev_close:
+                        live_breadth["declined"] += 1
+                    else:
+                        live_breadth["unchanged"] += 1
+                    if (
+                        prev_close not in (None, 0)
+                        and change_pct is not None
+                        and high is not None
+                        and low is not None
+                    ):
+                        if change_pct >= 9.95 and ltp >= high:
+                            live_breadth["positive_circuit"] += 1
+                        if change_pct <= -9.95 and ltp <= low:
+                            live_breadth["negative_circuit"] += 1
+                if live_breadth["compared_symbols"] > 0:
+                    breadth = live_breadth
+            except Exception:
+                pass
+
             movers_query = """
                 WITH latest_market AS (
                     SELECT symbol, close
-                    FROM price_history
+                    FROM clean_price_history
                     WHERE date = ?
                 ),
                 previous_market AS (
                     SELECT symbol, close AS previous_close
-                    FROM price_history
+                    FROM clean_price_history
                     WHERE date = ?
                 ),
                 latest_activity AS (
@@ -979,13 +1269,15 @@ def market_overview():
             sector_leaders = rows_to_list(conn.execute(
                 """
                 WITH latest AS (
-                    SELECT symbol, close, amount
-                    FROM daily_price
-                    WHERE date = ?
+                    SELECT dp.symbol, cp.close, dp.amount
+                    FROM daily_price dp
+                    JOIN clean_price_history cp
+                      ON cp.symbol = dp.symbol AND cp.date = dp.date
+                    WHERE dp.date = ?
                 ),
                 previous AS (
                     SELECT symbol, close AS previous_close
-                    FROM daily_price
+                    FROM clean_price_history
                     WHERE date = ?
                 )
                 SELECT
@@ -1002,6 +1294,180 @@ def market_overview():
                 LIMIT 12
                 """,
                 (latest_daily_date, previous_daily_date),
+            ).fetchall())
+
+            marquee_strip = rows_to_list(conn.execute(
+                """
+                WITH latest AS (
+                    SELECT dp.symbol, cp.close, dp.amount
+                    FROM daily_price dp
+                    JOIN clean_price_history cp
+                      ON cp.symbol = dp.symbol AND cp.date = dp.date
+                    WHERE dp.date = ?
+                ),
+                previous AS (
+                    SELECT ph.symbol, ph.close AS previous_close
+                    FROM clean_price_history ph
+                    JOIN (
+                        SELECT symbol, MAX(date) AS previous_date
+                        FROM clean_price_history
+                        WHERE date < ?
+                        GROUP BY symbol
+                    ) prev
+                      ON prev.symbol = ph.symbol
+                     AND prev.previous_date = ph.date
+                )
+                SELECT
+                    latest.symbol,
+                    ROUND(latest.close, 4) AS ltp,
+                    ROUND(latest.close - previous.previous_close, 4) AS change,
+                    ROUND(((latest.close - previous.previous_close) / NULLIF(previous.previous_close, 0)) * 100.0, 4) AS change_percent,
+                    COALESCE(about_company.company_name, latest.symbol) AS company_name
+                FROM latest
+                JOIN previous ON previous.symbol = latest.symbol
+                LEFT JOIN about_company ON about_company.symbol = latest.symbol
+                ORDER BY ABS(change_percent) DESC, latest.amount DESC, latest.symbol ASC
+                LIMIT 40
+                """,
+                (latest_daily_date, latest_daily_date),
+            ).fetchall())
+
+        if "sharehub_news_feed" in tables:
+            recent_news = rows_to_list(conn.execute(
+                """
+                SELECT
+                    post_id,
+                    slug,
+                    profile_name,
+                    profile_image_url,
+                    user_name,
+                    is_profile_verified,
+                    title,
+                    summary,
+                    media_url,
+                    launch_url,
+                    time_ago,
+                    published_date
+                FROM sharehub_news_feed
+                WHERE COALESCE(media_type, 'News') = 'News'
+                ORDER BY published_date DESC, post_id DESC
+                LIMIT 8
+                """
+            ).fetchall())
+
+        if "sharehub_public_offerings" in tables:
+            public_offerings = rows_to_list(conn.execute(
+                """
+                SELECT
+                    detail_slug,
+                    symbol,
+                    company_name,
+                    ratio,
+                    units,
+                    price,
+                    opening_date,
+                    closing_date,
+                    status,
+                    detail_url,
+                    offering_type
+                FROM sharehub_public_offerings
+                ORDER BY
+                    CASE
+                        WHEN closing_date IS NOT NULL
+                         AND closing_date >= COALESCE(?, closing_date)
+                        THEN 0 ELSE 1
+                    END,
+                    opening_date ASC,
+                    closing_date ASC,
+                    id DESC
+                LIMIT 8
+                """,
+                (latest_daily_date,),
+            ).fetchall())
+
+        if "sharehub_announcements" in tables:
+            recent_announcements = rows_to_list(conn.execute(
+                """
+                SELECT
+                    announcement_id,
+                    title,
+                    symbol,
+                    security_name,
+                    icon_url,
+                    subtitle,
+                    announcement_date,
+                    attachment_url,
+                    news_url,
+                    source,
+                    category,
+                    type
+                FROM sharehub_announcements
+                ORDER BY announcement_date DESC, announcement_id DESC
+                LIMIT 8
+                """
+            ).fetchall())
+
+        if "dividend" in tables:
+            proposed_dividends = rows_to_list(conn.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        d.symbol,
+                        d.fiscal_year,
+                        d.cash_dividend,
+                        d.bonus_share,
+                        d.right_share,
+                        d.fetched_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY d.symbol
+                            ORDER BY COALESCE(d.fetched_at, '') DESC, COALESCE(d.fiscal_year, '') DESC
+                        ) AS rn
+                    FROM dividend d
+                    WHERE COALESCE(d.cash_dividend, '') <> ''
+                       OR COALESCE(d.bonus_share, '') <> ''
+                       OR COALESCE(d.right_share, '') <> ''
+                )
+                SELECT
+                    ranked.symbol,
+                    COALESCE(ac.company_name, ranked.symbol) AS company_name,
+                    ranked.fiscal_year,
+                    ranked.cash_dividend,
+                    ranked.bonus_share,
+                    ranked.right_share,
+                    ranked.fetched_at
+                FROM ranked
+                LEFT JOIN about_company ac ON ac.symbol = ranked.symbol
+                WHERE ranked.rn = 1
+                ORDER BY
+                    CASE WHEN COALESCE(ranked.cash_dividend, '') <> '' THEN 0 ELSE 1 END,
+                    CASE WHEN COALESCE(ranked.bonus_share, '') <> '' THEN 0 ELSE 1 END,
+                    ranked.fetched_at DESC,
+                    ranked.symbol ASC
+                LIMIT 12
+                """
+            ).fetchall())
+
+        latest_floor_date = get_table_max_date(conn, "floor_sheet")
+        if latest_floor_date:
+            bulk_transactions = rows_to_list(conn.execute(
+                """
+                SELECT
+                    fs.symbol,
+                    fs.date,
+                    fs.buyer_broker,
+                    fs.seller_broker,
+                    fs.quantity,
+                    fs.rate,
+                    fs.amount,
+                    COALESCE(ac.company_name, fs.symbol) AS company_name
+                FROM floor_sheet fs
+                LEFT JOIN about_company ac ON ac.symbol = fs.symbol
+                WHERE fs.date = ?
+                  AND COALESCE(fs.quantity, 0) > 5000
+                ORDER BY fs.amount DESC, fs.quantity DESC, fs.symbol ASC
+                LIMIT 20
+                """,
+                (latest_floor_date,),
             ).fetchall())
 
         latest_sector_date = conn.execute(
@@ -1051,9 +1517,256 @@ def market_overview():
             "top_turnover": top_turnover,
             "top_traded_shares": top_traded,
             "top_transactions": top_transactions,
+            "marquee_strip": marquee_strip,
+            "recent_news": recent_news,
+            "public_offerings": public_offerings,
+            "bulk_transactions": bulk_transactions,
+            "recent_announcements": recent_announcements,
+            "proposed_dividends": proposed_dividends,
             "signal_date": sig_date,
             "signal_breakdown": breakdown,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/home/news")
+def home_news():
+    conn = get_db()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+        offset = max(0, int(request.args.get("offset", 0)))
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "sharehub_news_feed" not in tables:
+            return jsonify({"items": [], "count": 0})
+
+        rows = rows_to_list(conn.execute(
+            """
+            SELECT
+                post_id,
+                slug,
+                profile_name,
+                profile_image_url,
+                user_name,
+                is_profile_verified,
+                title,
+                summary,
+                media_url,
+                launch_url,
+                time_ago,
+                published_date
+            FROM sharehub_news_feed
+            WHERE COALESCE(media_type, 'News') = 'News'
+            ORDER BY published_date DESC, post_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall())
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sharehub_news_feed WHERE COALESCE(media_type, 'News') = 'News'"
+        ).fetchone()[0]
+        return jsonify({"items": rows, "count": count, "limit": limit, "offset": offset})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/home/public-offerings")
+def home_public_offerings():
+    conn = get_db()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 250))
+        offset = max(0, int(request.args.get("offset", 0)))
+        offering_type = (request.args.get("type") or "").strip().upper()
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "sharehub_public_offerings" not in tables:
+            return jsonify({"items": [], "count": 0})
+
+        where = ""
+        params = []
+        if offering_type:
+            where = "WHERE UPPER(COALESCE(offering_type, '')) LIKE ?"
+            params.append(f"%{offering_type}%")
+
+        rows = rows_to_list(conn.execute(
+            f"""
+            SELECT
+                detail_slug,
+                symbol,
+                company_name,
+                ratio,
+                units,
+                price,
+                opening_date,
+                closing_date,
+                status,
+                detail_url,
+                offering_type
+            FROM sharehub_public_offerings
+            {where}
+            ORDER BY
+                CASE
+                    WHEN closing_date IS NOT NULL
+                     AND closing_date >= COALESCE((SELECT MAX(date) FROM daily_price), closing_date)
+                    THEN 0 ELSE 1
+                END,
+                opening_date ASC,
+                closing_date ASC,
+                id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall())
+        count = conn.execute(
+            f"SELECT COUNT(*) FROM sharehub_public_offerings {where}",
+            params,
+        ).fetchone()[0]
+        return jsonify({"items": rows, "count": count, "limit": limit, "offset": offset, "type": offering_type or None})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/home/bulk-transactions")
+def home_bulk_transactions():
+    conn = get_db()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 300))
+        offset = max(0, int(request.args.get("offset", 0)))
+        target_date = request.args.get("date") or get_table_max_date(conn, "floor_sheet")
+        rows = rows_to_list(conn.execute(
+            """
+            SELECT
+                fs.symbol,
+                fs.date,
+                fs.buyer_broker,
+                fs.seller_broker,
+                fs.quantity,
+                fs.rate,
+                fs.amount,
+                COALESCE(ac.company_name, fs.symbol) AS company_name
+            FROM floor_sheet fs
+            LEFT JOIN about_company ac ON ac.symbol = fs.symbol
+            WHERE fs.date = ?
+              AND COALESCE(fs.quantity, 0) > 5000
+            ORDER BY fs.amount DESC, fs.quantity DESC, fs.symbol ASC
+            LIMIT ? OFFSET ?
+            """,
+            (target_date, limit, offset),
+        ).fetchall()) if target_date else []
+        count = conn.execute(
+            "SELECT COUNT(*) FROM floor_sheet WHERE date = ? AND COALESCE(quantity, 0) > 5000",
+            (target_date,),
+        ).fetchone()[0] if target_date else 0
+        return jsonify({"items": rows, "count": count, "date": target_date, "limit": limit, "offset": offset})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/home/announcements")
+def home_announcements():
+    conn = get_db()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+        offset = max(0, int(request.args.get("offset", 0)))
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "sharehub_announcements" not in tables:
+            return jsonify({"items": [], "count": 0})
+
+        rows = rows_to_list(conn.execute(
+            """
+            SELECT
+                announcement_id,
+                title,
+                symbol,
+                security_name,
+                icon_url,
+                subtitle,
+                announcement_date,
+                attachment_url,
+                news_url,
+                source,
+                category,
+                type
+            FROM sharehub_announcements
+            ORDER BY announcement_date DESC, announcement_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall())
+        count = conn.execute("SELECT COUNT(*) FROM sharehub_announcements").fetchone()[0]
+        return jsonify({"items": rows, "count": count, "limit": limit, "offset": offset})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/home/dividends")
+def home_dividends():
+    conn = get_db()
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 250))
+        offset = max(0, int(request.args.get("offset", 0)))
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "dividend" not in tables:
+            return jsonify({"items": [], "count": 0})
+
+        ranked_cte = """
+            WITH ranked AS (
+                SELECT
+                    d.symbol,
+                    d.fiscal_year,
+                    d.cash_dividend,
+                    d.bonus_share,
+                    d.right_share,
+                    d.fetched_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.symbol
+                        ORDER BY COALESCE(d.fetched_at, '') DESC, COALESCE(d.fiscal_year, '') DESC
+                    ) AS rn
+                FROM dividend d
+                WHERE COALESCE(d.cash_dividend, '') <> ''
+                   OR COALESCE(d.bonus_share, '') <> ''
+                   OR COALESCE(d.right_share, '') <> ''
+            )
+        """
+        rows = rows_to_list(conn.execute(
+            f"""
+            {ranked_cte}
+            SELECT
+                ranked.symbol,
+                COALESCE(ac.company_name, ranked.symbol) AS company_name,
+                ranked.fiscal_year,
+                ranked.cash_dividend,
+                ranked.bonus_share,
+                ranked.right_share,
+                ranked.fetched_at
+            FROM ranked
+            LEFT JOIN about_company ac ON ac.symbol = ranked.symbol
+            WHERE ranked.rn = 1
+            ORDER BY
+                CASE WHEN COALESCE(ranked.cash_dividend, '') <> '' THEN 0 ELSE 1 END,
+                CASE WHEN COALESCE(ranked.bonus_share, '') <> '' THEN 0 ELSE 1 END,
+                ranked.fetched_at DESC,
+                ranked.symbol ASC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall())
+        count = conn.execute(
+            f"""
+            {ranked_cte}
+            SELECT COUNT(*) FROM ranked WHERE rn = 1
+            """
+        ).fetchone()[0]
+        return jsonify({"items": rows, "count": count, "limit": limit, "offset": offset})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -1197,22 +1910,36 @@ def get_stock(symbol):
     try:
         symbol = symbol.upper()
         prices = rows_to_list(conn.execute("""
-             SELECT p.date,
-                 COALESCE(c.open, NULLIF(p.open, 0), p.close) AS open,
-                 COALESCE(c.high, p.high) AS high,
-                 COALESCE(c.low, p.low) AS low,
-                 COALESCE(c.close, p.close) AS close,
-                 COALESCE(c.volume, p.volume) AS volume,
-                 c.price_change_pct,
-                 c.volume_ratio,
-                 c.atr14,
-                 c.market_condition
-             FROM   price_history p
-             LEFT JOIN clean_price_history c
-                 ON c.symbol = p.symbol AND c.date = p.date
-             WHERE  p.symbol = ?
-            ORDER  BY p.date DESC
+             SELECT c.date,
+                    c.open,
+                    c.high,
+                    c.low,
+                    c.close,
+                    c.volume,
+                    c.price_change_pct,
+                    c.volume_ratio,
+                    c.atr14,
+                    c.market_condition
+             FROM   clean_price_history c
+             WHERE  c.symbol = ?
+             ORDER  BY c.date DESC
         """, (symbol,)).fetchall())
+        if not prices:
+            prices = rows_to_list(conn.execute("""
+                 SELECT p.date,
+                        p.open,
+                        p.high,
+                        p.low,
+                        p.close,
+                        p.volume,
+                        NULL AS price_change_pct,
+                        NULL AS volume_ratio,
+                        NULL AS atr14,
+                        NULL AS market_condition
+                 FROM   price_history p
+                 WHERE  p.symbol = ?
+                 ORDER  BY p.date DESC
+            """, (symbol,)).fetchall())
         prices.reverse()
 
         latest_signal = conn.execute("""
@@ -1221,13 +1948,14 @@ def get_stock(symbol):
             ORDER  BY date DESC LIMIT 1
         """, (symbol,)).fetchone()
 
-        company = conn.execute(
-            "SELECT * FROM companies WHERE symbol = ?", (symbol,)
-        ).fetchone()
+        company = next(
+            (row for row in build_companies_catalog(conn) if row["symbol"] == symbol),
+            None,
+        )
 
         return jsonify({
             "symbol":        symbol,
-            "company":       dict(company) if company else {},
+            "company":       company if company else {},
             "price_history": prices,
             "latest_signal": dict(latest_signal) if latest_signal else {},
         })
@@ -1244,17 +1972,15 @@ def get_ohlcv(symbol):
     try:
         symbol = symbol.upper()
         rows = conn.execute("""
-            SELECT p.date,
-                   COALESCE(c.open, NULLIF(p.open, 0), p.close) AS open,
-                   COALESCE(c.high, p.high) AS high,
-                   COALESCE(c.low, p.low) AS low,
-                   COALESCE(c.close, p.close) AS close,
-                   COALESCE(c.volume, p.volume) AS volume
-            FROM   price_history p
-            LEFT JOIN clean_price_history c
-                   ON c.symbol = p.symbol AND c.date = p.date
-            WHERE  p.symbol = ?
-            ORDER  BY p.date DESC
+            SELECT c.date,
+                   c.open,
+                   c.high,
+                   c.low,
+                   c.close,
+                   c.volume
+            FROM   clean_price_history c
+            WHERE  c.symbol = ?
+            ORDER  BY c.date DESC
         """, (symbol,)).fetchall()
         rows = list(reversed(rows))
 
@@ -1280,19 +2006,31 @@ def get_price(symbol):
     try:
         symbol = symbol.upper()
         rows = conn.execute("""
-             SELECT p.date,
-                 COALESCE(c.open, NULLIF(p.open, 0), p.close) AS open,
-                 COALESCE(c.high, p.high) AS high,
-                 COALESCE(c.low, p.low) AS low,
-                 COALESCE(c.close, p.close) AS close,
-                 COALESCE(c.volume, p.volume) AS volume,
-                 c.market_condition
-             FROM   price_history p
-             LEFT JOIN clean_price_history c
-                 ON c.symbol = p.symbol AND c.date = p.date
-             WHERE  p.symbol = ?
-             ORDER  BY p.date DESC
+             SELECT c.date,
+                    c.open,
+                    c.high,
+                    c.low,
+                    c.close,
+                    c.volume,
+                    c.market_condition
+             FROM   clean_price_history c
+             WHERE  c.symbol = ?
+             ORDER  BY c.date DESC
         """, (symbol,)).fetchall()
+
+        if not rows:
+            rows = conn.execute("""
+                 SELECT p.date,
+                        p.open,
+                        p.high,
+                        p.low,
+                        p.close,
+                        p.volume,
+                        NULL AS market_condition
+                 FROM   price_history p
+                 WHERE  p.symbol = ?
+                 ORDER  BY p.date DESC
+            """, (symbol,)).fetchall()
 
         if not rows:
             return jsonify({"error": f"Symbol '{symbol}' not found"}), 404
@@ -1416,15 +2154,9 @@ def get_companies():
     conn = get_db()
     try:
         sector = request.args.get("sector", "")
+        rows = build_companies_catalog(conn)
         if sector:
-            rows = rows_to_list(conn.execute(
-                "SELECT * FROM companies WHERE sector = ? ORDER BY symbol",
-                (sector,)
-            ).fetchall())
-        else:
-            rows = rows_to_list(conn.execute(
-                "SELECT * FROM companies ORDER BY symbol"
-            ).fetchall())
+            rows = [row for row in rows if row.get("sector") == sector]
         return jsonify({"count": len(rows), "companies": rows})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1450,6 +2182,121 @@ def get_sectors():
 
 
 # ── OPTIMIZER ─────────────────────────────────────────────────────────────────
+@app.route("/api/indices")
+def get_indices():
+    conn = get_db()
+    try:
+        latest_date = conn.execute("SELECT MAX(date) FROM sector_index").fetchone()[0]
+        previous_date = conn.execute(
+            "SELECT MAX(date) FROM sector_index WHERE date < ?",
+            (latest_date,),
+        ).fetchone()[0] if latest_date else None
+        rows = rows_to_list(conn.execute(
+            """
+            SELECT
+                current.sector AS name,
+                current.date,
+                current.value,
+                previous.value AS previous_value,
+                ROUND(current.value - COALESCE(previous.value, current.value), 4) AS point_change,
+                ROUND(((current.value - COALESCE(previous.value, current.value)) / NULLIF(previous.value, 0)) * 100.0, 4) AS change_percent
+            FROM sector_index current
+            LEFT JOIN sector_index previous
+                ON previous.sector = current.sector AND previous.date = ?
+            WHERE current.date = ?
+            ORDER BY CASE WHEN current.sector = 'NEPSE' THEN 0 ELSE 1 END, current.sector ASC
+            """,
+            (previous_date, latest_date),
+        ).fetchall()) if latest_date else []
+        return jsonify({
+            "date": latest_date,
+            "previous_date": previous_date,
+            "count": len(rows),
+            "indices": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/api/indices/<path:index_name>/history")
+def get_index_history(index_name):
+    conn = get_db()
+    try:
+        index_name = index_name.strip()
+        limit = max(30, min(int(request.args.get("limit", 600)), 5000))
+
+        exists = conn.execute(
+            "SELECT 1 FROM sector_index WHERE sector = ? LIMIT 1",
+            (index_name,),
+        ).fetchone()
+        if not exists:
+            return jsonify({"error": f"Unknown index '{index_name}'"}), 404
+
+        history_desc = rows_to_list(conn.execute(
+            """
+            SELECT
+                date,
+                sector AS name,
+                value
+            FROM sector_index
+            WHERE sector = ?
+            ORDER BY date DESC
+            LIMIT ?
+            """,
+            (index_name, limit),
+        ).fetchall())
+        history = list(reversed(history_desc))
+
+        previous_value = None
+        for row in history:
+            value = row.get("value")
+            row["previous_value"] = previous_value
+            if previous_value in (None, 0) or value is None:
+                row["point_change"] = None
+                row["change_percent"] = None
+            else:
+                row["point_change"] = round(value - previous_value, 4)
+                row["change_percent"] = round(((value - previous_value) / previous_value) * 100.0, 4)
+            previous_value = value
+
+        latest = history[-1] if history else None
+        earliest = history[0] if history else None
+        high_row = max(history, key=lambda item: float(item.get("value") or float("-inf"))) if history else None
+        low_row = min(history, key=lambda item: float(item.get("value") or float("inf"))) if history else None
+
+        period_change = None
+        period_change_percent = None
+        if earliest and latest and earliest.get("value") not in (None, 0) and latest.get("value") is not None:
+            period_change = round(float(latest["value"]) - float(earliest["value"]), 4)
+            period_change_percent = round((period_change / float(earliest["value"])) * 100.0, 4)
+
+        return jsonify({
+            "index": index_name,
+            "count": len(history),
+            "history": history,
+            "latest": latest,
+            "stats": {
+                "from_date": earliest.get("date") if earliest else None,
+                "to_date": latest.get("date") if latest else None,
+                "latest_value": latest.get("value") if latest else None,
+                "latest_change": latest.get("point_change") if latest else None,
+                "latest_change_percent": latest.get("change_percent") if latest else None,
+                "period_change": period_change,
+                "period_change_percent": period_change_percent,
+                "high_value": high_row.get("value") if high_row else None,
+                "high_date": high_row.get("date") if high_row else None,
+                "low_value": low_row.get("value") if low_row else None,
+                "low_date": low_row.get("date") if low_row else None,
+            },
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @app.route("/api/optimizer/leaderboard")
 def optimizer_leaderboard():
     conn = get_db()
@@ -1849,13 +2696,13 @@ def floorsheet_symbol(symbol):
             (sym, since, end_date)
         ).fetchone()[0]
 
-        trades = rows_to_list(conn.execute("""
+        trades = normalize_floorsheet_trade_rows(rows_to_list(conn.execute("""
             SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
             FROM floor_sheet
             WHERE symbol=? AND date BETWEEN ? AND ?
             ORDER BY date DESC, id DESC
             LIMIT ? OFFSET ?
-        """, (sym, since, end_date, limit, offset)).fetchall())
+        """, (sym, since, end_date, limit, offset)).fetchall()))
 
         return jsonify({
             "symbol": sym,
@@ -1893,13 +2740,13 @@ def floorsheet_symbol_by_date(symbol, date_str):
         if total_count == 0:
             return jsonify({"error": f"No floorsheet data for '{sym}' on '{date_str}'"}), 404
 
-        trades = rows_to_list(conn.execute("""
+        trades = normalize_floorsheet_trade_rows(rows_to_list(conn.execute("""
             SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
             FROM floor_sheet
             WHERE symbol=? AND date=?
             ORDER BY id ASC
             LIMIT ? OFFSET ?
-        """, (sym, date_str, limit, offset)).fetchall())
+        """, (sym, date_str, limit, offset)).fetchall()))
 
         return jsonify({
             "symbol": sym,
@@ -1934,13 +2781,13 @@ def floorsheet_by_date(date_str):
         symbol_count = conn.execute(
             "SELECT COUNT(DISTINCT symbol) FROM floor_sheet WHERE date=?", (date_str,)
         ).fetchone()[0]
-        trades = rows_to_list(conn.execute("""
+        trades = normalize_floorsheet_trade_rows(rows_to_list(conn.execute("""
             SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
             FROM floor_sheet
             WHERE date=?
             ORDER BY symbol ASC, id ASC
             LIMIT ? OFFSET ?
-        """, (date_str, limit, offset)).fetchall())
+        """, (date_str, limit, offset)).fetchall()))
 
         return jsonify({
             "date": date_str,
@@ -1976,13 +2823,13 @@ def floorsheet_latest():
         symbol_count = conn.execute(
             "SELECT COUNT(DISTINCT symbol) FROM floor_sheet WHERE date=?", (latest_date,)
         ).fetchone()[0]
-        trades = rows_to_list(conn.execute("""
+        trades = normalize_floorsheet_trade_rows(rows_to_list(conn.execute("""
             SELECT id, date, symbol, buyer_broker, seller_broker, quantity, rate, amount, fetched_at
             FROM floor_sheet
             WHERE date=?
             ORDER BY symbol ASC, id ASC
             LIMIT ? OFFSET ?
-        """, (latest_date, limit, offset)).fetchall())
+        """, (latest_date, limit, offset)).fetchall()))
 
         return jsonify({
             "date": latest_date,

@@ -347,6 +347,105 @@ class MeroShareClient:
             )
         return results
 
+    def get_wacc_report_via_browser(
+        self,
+        *,
+        demat: str,
+        boid: str | None = None,
+        client_code: str | None = None,
+        page: int = 1,
+        size: int = 500,
+    ) -> list[PurchaseHistoryRow]:
+        from playwright.sync_api import sync_playwright
+
+        auth_token = self.session.headers.get("Authorization")
+        if not auth_token:
+            raise MeroShareClientError("No active MeroShare authorization token is available for browser WACC fetch.")
+
+        payload: dict[str, Any] = {
+            "demat": str(demat),
+            "page": int(page),
+            "size": int(size),
+        }
+        if boid:
+            payload["boid"] = str(boid)
+        if client_code:
+            payload["clientCode"] = str(client_code)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page_obj = browser.new_page()
+            try:
+                page_obj.goto(f"{self.origin}/", wait_until="domcontentloaded", timeout=int(self.timeout * 1000))
+                result = page_obj.evaluate(
+                    """
+                    async ({ url, payload, authorization }) => {
+                      const response = await fetch(url, {
+                        method: "POST",
+                        headers: {
+                          "Accept": "application/json, text/plain, */*",
+                          "Content-Type": "application/json",
+                          "Authorization": authorization,
+                        },
+                        body: JSON.stringify(payload),
+                      });
+                      const text = await response.text();
+                      return {
+                        status: response.status,
+                        contentType: response.headers.get("content-type") || "",
+                        text,
+                      };
+                    }
+                    """,
+                    {
+                        "url": "https://webbackend.cdsc.com.np/api/myPurchase/waccReport/",
+                        "payload": payload,
+                        "authorization": auth_token,
+                    },
+                )
+            finally:
+                browser.close()
+
+        status = int(result.get("status") or 0)
+        text = result.get("text") or ""
+        content_type = str(result.get("contentType") or "").lower()
+        if status not in (200, 201):
+            raise MeroShareClientError(f"Browser WACC fetch failed: {status} {text[:400]}")
+        if "json" not in content_type and not text[:1] in ("{", "["):
+            raise MeroShareClientError(f"Browser WACC fetch returned non-JSON payload: {text[:400]}")
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            raise MeroShareClientError(f"Browser WACC fetch returned invalid JSON: {exc}") from exc
+
+        rows = []
+        if isinstance(data, dict):
+            maybe_rows = data.get("waccReportResponse")
+            if isinstance(maybe_rows, list):
+                rows = [row for row in maybe_rows if isinstance(row, dict)]
+        elif isinstance(data, list):
+            rows = [row for row in data if isinstance(row, dict)]
+
+        results: list[PurchaseHistoryRow] = []
+        for row in rows:
+            symbol = row.get("scrip") or row.get("script") or row.get("symbol")
+            qty = row.get("totalQuantity") or row.get("currentQuantity") or row.get("quantity") or row.get("qty")
+            wacc = row.get("averageBuyRate") or row.get("wacc") or row.get("rate")
+            amount = row.get("totalCost") or row.get("marketValue") or row.get("amount")
+            results.append(
+                PurchaseHistoryRow(
+                    symbol=str(symbol or "").upper(),
+                    transaction_date=row.get("lastModifiedDate") or row.get("transactionDate") or row.get("date"),
+                    quantity=_safe_float(qty, 0.0) or 0.0,
+                    rate=_safe_float(wacc, None),
+                    amount=_safe_float(amount, None),
+                    wacc=_safe_float(wacc, None),
+                    transaction_type="WACC_BROWSER",
+                    raw=row,
+                )
+            )
+        return results
+
     def get_transaction_history(
         self,
         *,

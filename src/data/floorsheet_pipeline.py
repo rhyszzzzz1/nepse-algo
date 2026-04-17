@@ -177,6 +177,7 @@ def _http_get_json(url, params=None, timeout=30):
                 headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
             )
             if resp.status_code == 429:
+                last_error = RuntimeError(f"429 Too Many Requests for {url} params={params}")
                 wait = min(2 ** attempt, 20)
                 time.sleep(wait)
                 continue
@@ -187,7 +188,7 @@ def _http_get_json(url, params=None, timeout=30):
             if attempt == 4:
                 break
             time.sleep(min(2 ** attempt, 20))
-    raise last_error
+    raise last_error or RuntimeError(f"HTTP JSON request failed without explicit exception for {url} params={params}")
 
 def _is_nepse_holiday(dt):
     """NEPSE trades Sun–Thu. Fri (4) and Sat (5) are holidays."""
@@ -442,7 +443,7 @@ def fetch_by_date_via_sharehub(date_str_ymd, return_status=False, page_size=500)
         print(f"[ShareHub] Fetching floor sheet for {date_str_ymd}...")
         first_payload = _http_get_json(
             SHAREHUB_FLOORSHEET_BY_DATE_URL,
-            params={"Size": page_size, "currentPage": 1, "date": sharehub_date},
+            params={"Size": page_size, "page": 1, "date": sharehub_date},
         )
         data = first_payload.get("data") or {}
         first_content = data.get("content") or []
@@ -479,7 +480,7 @@ def fetch_by_date_via_sharehub(date_str_ymd, return_status=False, page_size=500)
         def _fetch_page(page_no):
             payload = _http_get_json(
                 SHAREHUB_FLOORSHEET_BY_DATE_URL,
-                params={"Size": page_size, "currentPage": page_no, "date": sharehub_date},
+                params={"Size": page_size, "page": page_no, "date": sharehub_date},
                 timeout=40,
             )
             return page_no, ((payload.get("data") or {}).get("content") or [])
@@ -511,7 +512,7 @@ def fetch_by_date_via_sharehub(date_str_ymd, return_status=False, page_size=500)
         return _ret(0, "error", str(e))
 
 
-def fetch_by_date_via_chukul(date_str_ymd, return_status=False, page_size=500):
+def fetch_by_date_via_chukul(date_str_ymd, return_status=False, page_size=100000):
     """Fetch full market floor sheet for one date from Chukul."""
     fetched_at = datetime.now().isoformat()
 
@@ -1266,7 +1267,7 @@ def run_daily_update(prune_raw=True):
     """
     Called every trading day after market close (4 PM NST).
     1. Tries Chukul by-date floorsheet first.
-    2. Falls back to ShareHub, then Merolagani if needed.
+    2. Falls back to ShareHub if needed.
     3. Recomputes broker_summary + daily_price.
     4. Optionally prunes raw floor_sheet rows (prune_raw=True by default).
     """
@@ -1283,12 +1284,6 @@ def run_daily_update(prune_raw=True):
         if not saved:
             print("[Daily] Chukul daily floorsheet unavailable; trying ShareHub...")
             saved, status, _ = fetch_by_date_via_sharehub(today, return_status=True)
-        if not saved:
-            if status == "error":
-                print("[Daily] ShareHub/Chukul fetch errored; falling back to Merolagani scrape...")
-            else:
-                print("[Daily] ShareHub/Chukul returned no data; falling back to Merolagani scrape...")
-            saved = fetch_historical_via_merolagani(today)
         if not saved:
             print(f"[Daily] No floor sheet data available for {today}")
             return
@@ -1351,8 +1346,6 @@ def run_historical_backfill(days_back=None, start_date=None, prune_raw=False):
         saved, status, reason = fetch_by_date_via_chukul(date_str, return_status=True)
         if not saved:
             saved, status, reason = fetch_by_date_via_sharehub(date_str, return_status=True)
-        if not saved:
-            saved, status, reason = fetch_historical_via_merolagani(date_str, return_status=True)
         if status == "no_data":
             _mark_backfill_skip_date(date_str, reason)
             print(f"  [{date_str}] Marked as no-data for future runs ({reason})")
